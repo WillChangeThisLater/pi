@@ -110,6 +110,7 @@ class DictationComponent implements Component {
 		if (
 			matchesKey(data, "enter") ||
 			matchesKey(data, "ctrl+shift+space") ||
+			matchesKey(data, "ctrl+space") ||
 			matchesKey(data, "alt+space") ||
 			matchesKey(data, "ctrl+m")
 		) {
@@ -402,6 +403,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.registerShortcut("ctrl+shift+space", { description: "Toggle dictation", handler: toggle });
+	pi.registerShortcut("ctrl+space", { description: "Toggle dictation (legacy terminal fallback)", handler: toggle });
 	pi.registerShortcut("alt+space", { description: "Toggle dictation (fallback)", handler: toggle });
 	pi.registerCommand("dictate", {
 		description: "Toggle dictation",
