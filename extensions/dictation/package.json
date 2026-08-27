@@ -1,0 +1,13 @@
+{
+	"name": "pi-dictation",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Push-to-talk dictation for pi: live offline speech-to-text into the prompt editor",
+	"dependencies": {
+		"sherpa-onnx-node": "1.13.6"
+	},
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	}
+}
