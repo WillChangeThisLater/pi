@@ -308,7 +308,8 @@ export default function (pi: ExtensionAPI) {
 		audioBuf = Buffer.alloc(0);
 		pcmAccumulator = Buffer.alloc(0);
 
-		// Test hook: read a wav in chunks instead of the mic.
+		// Start capture BEFORE opening the custom UI so audio is buffered
+		// from the moment the user presses the shortcut.
 		if (process.env.PI_DICTATION_SOURCE_FILE) {
 			let samples: Float32Array;
 			try {
@@ -319,48 +320,8 @@ export default function (pi: ExtensionAPI) {
 				recording = false;
 				return;
 			}
-			let offset = 0;
-			const feedMs = Number(process.env.PI_DICTATION_TEST_FEED_MS ?? 150);
-			drainTimer = setInterval(() => {
-				if (!recording || !stream) return;
-				const end = Math.min(offset + MIN_FEED_SAMPLES, samples.length);
-				const piece = samples.subarray(offset, end);
-				if (piece.length > 0) {
-					stream.acceptWaveform({ sampleRate: SAMPLE_RATE, samples: piece });
-					recognizer.decode(stream);
-				if (recognizer.isEndpoint(stream)) {
-					stream.inputFinished();
-					recognizer.decode(stream);
-					const result = recognizer.getResult(stream);
-					if (result?.text) segments.push(normalizeTranscript(result.text));
-					currentPartial = "";
-					stream = recognizer.createStream();
-				} else {
-					const result = recognizer.getResult(stream);
-					const partial = (result?.text ?? "") as string;
-					if (partial !== currentPartial) {
-						currentPartial = partial;
-					}
-				}
-					component?.update(displayText());
-					offset = end;
-				}
-				if (end >= samples.length) {
-					if (stream) {
-						stream.inputFinished();
-						recognizer.decode(stream);
-						const result = recognizer.getResult(stream);
-						if (result?.text) segments.push(normalizeTranscript(result.text));
-					}
-					currentPartial = "";
-					if (drainTimer) {
-						clearInterval(drainTimer);
-						drainTimer = null;
-					}
-					component?.update(transcriptText());
-					component?.handleInput("\r");
-				}
-			}, feedMs);
+			// Store samples so the factory can start the feed timer.
+			(globalThis as any).__dictationTestSamples = samples;
 		} else {
 			startMicCapture();
 			drainTimer = setInterval(drainAudio, DRAIN_INTERVAL_MS);
@@ -368,21 +329,58 @@ export default function (pi: ExtensionAPI) {
 
 		const result = await ctx.ui.custom((tui, _theme, _kb, done) => {
 			component = new DictationComponent(tui, (r) => done(r));
+			// Test hook: start feeding wav samples now that the component exists.
+			if (process.env.PI_DICTATION_SOURCE_FILE) {
+				const samples = (globalThis as any).__dictationTestSamples as Float32Array;
+				let offset = 0;
+				const feedMs = Number(process.env.PI_DICTATION_TEST_FEED_MS ?? 150);
+				drainTimer = setInterval(() => {
+					if (!recording || !stream) return;
+					const end = Math.min(offset + MIN_FEED_SAMPLES, samples.length);
+					const piece = samples.subarray(offset, end);
+					if (piece.length > 0) {
+						stream.acceptWaveform({ sampleRate: SAMPLE_RATE, samples: piece });
+						recognizer.decode(stream);
+						const result = recognizer.getResult(stream);
+						const partial = (result?.text ?? "") as string;
+						if (partial !== currentPartial) {
+							currentPartial = partial;
+						}
+						component?.update(displayText());
+						offset = end;
+					}
+					if (end >= samples.length) {
+						if (stream) {
+							stream.inputFinished();
+							recognizer.decode(stream);
+							const result = recognizer.getResult(stream);
+							if (result?.text) segments.push(normalizeTranscript(result.text));
+						}
+						currentPartial = "";
+						if (drainTimer) {
+							clearInterval(drainTimer);
+							drainTimer = null;
+						}
+						component?.update(transcriptText());
+						component?.handleInput("\r");
+					}
+				}, feedMs);
+			}
 			return component;
 		});
 
 		// Custom UI closed: recording stopped.
 		recording = false;
 		cleanupCapture();
+		delete (globalThis as any).__dictationTestSamples;
 
+		// Commit the transcript to the editor.
 		if (result === RESULT_COMMIT || result === undefined) {
 			const text = normalizeTranscript(transcriptText());
-			(globalThis as any).__dictationDebug?.onCommit?.(result, segments, currentPartial);
 			if (text) {
 				const base = ctx.ui.getEditorText();
 				const next = base ? `${base} ${text}` : text;
 				ctx.ui.setEditorText(next);
-				(globalThis as any).__dictationDebug?.afterSetEditorText?.(next, ctx.ui.getEditorText());
 			}
 		}
 	}
