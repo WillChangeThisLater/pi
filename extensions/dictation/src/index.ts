@@ -157,7 +157,7 @@ export default function (pi: ExtensionAPI) {
 		const bytesPerSample = 2;
 		const availBytes = Math.floor(pcmAccumulator.length / bytesPerSample) * bytesPerSample;
 		const availSamples = availBytes / bytesPerSample;
-		if (availSamples < 16000) return; // need ~1s for the feature extractor
+		if (availSamples < 13000) return; // need ~0.8s for the feature extractor (39 frames × 320)
 
 		const floatChunk = new Float32Array(availSamples);
 		for (let i = 0; i < availSamples; i++) {
