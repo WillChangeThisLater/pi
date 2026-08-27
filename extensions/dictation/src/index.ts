@@ -3,19 +3,21 @@
  *
  * Bindings:
  *   ctrl+shift+space  toggle dictation (start / stop+commit)
- *   alt+space         same (legacy-terminal fallback; ctrl+shift+space is
- *                     ambiguous in terminals without the Kitty protocol)
+ *   ctrl+space        same (legacy-terminal fallback — tmux, etc.)
+ *   alt+space         same (definitive fallback for any terminal)
  *   /dictate          command form of the toggle
  *
  * While the dictation surface is open:
  *   Enter             stop and commit the transcript into the prompt
  *   Escape            cancel and discard (prompt is left unchanged)
- *   ctrl+shift+space  same as Enter
+ *   ctrl+space        same as Enter
  *
  * Env vars:
  *   PI_DICTATION_MODEL_DIR  model directory (default ~/.pi/agent/models/...)
  *   PI_DICTATION_SOURCE_FILE  test hook: transcribe this wav instead of the mic
+ *   PI_DICTATION_TEST_FEED_MS  feed tick for the wav source (default 150)
  *   PI_DICTATION_CASE  "sentence" (default) or "keep"
+ *   PI_DICTATION_DEBUG  show key/commit debug notifications
  *
  * See scripts/download-model.sh to fetch the model.
  */
@@ -34,6 +36,7 @@ const sherpa = require("sherpa-onnx-node") as typeof import("sherpa-onnx-node");
 
 const SAMPLE_RATE = 16000;
 const FEED_CHUNK = 8000; // 0.5s per decode step
+const MIN_FEED_SAMPLES = 16000; // 1s — feature extractor needs ~39 frames
 const DRAIN_INTERVAL_MS = 100;
 
 const DEFAULT_MODEL_DIR = path.join(
@@ -118,14 +121,14 @@ class DictationComponent implements Component {
 			return;
 		}
 		if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
-			this.done(RESULT_CANCEL);
+			this.done(RESULT_COMMIT);
 			return;
 		}
 	}
 
 	render(width: number): string[] {
 		const widthSafe = Math.max(10, width);
-		const header = "● Dictation — Enter stop · Esc cancel";
+		const header = "● Dictation — Enter/Esc stop — text committed";
 		const lines: string[] = [];
 		lines.push(header.slice(0, widthSafe));
 		if (this.text) {
@@ -147,6 +150,7 @@ export default function (pi: ExtensionAPI) {
 	let stream: any = null;
 	let child: ReturnType<typeof spawn> | null = null;
 	let audioBuf = Buffer.alloc(0);
+	let pcmAccumulator = Buffer.alloc(0);
 	let drainTimer: ReturnType<typeof setInterval> | null = null;
 	let component: DictationComponent | null = null;
 	let uiCtx: ExtensionContext | null = null;
@@ -177,54 +181,48 @@ export default function (pi: ExtensionAPI) {
 		}
 		child = null;
 		audioBuf = Buffer.alloc(0);
+		pcmAccumulator = Buffer.alloc(0);
 		stream = null;
-		// NOTE: segments/currentPartial are intentionally NOT reset here; the
-		// commit path reads them after the custom surface closes. They are
-		// reset at the start of each recording instead.
 	}
 
-	/** Feed accumated PCM to the recognizer; update the live text. */
+	/** Feed accumulated PCM to the recognizer; update the live text. */
 	function drainAudio(): void {
 		if (!recognizer || !stream || !recording) return;
 
-		// Convert all buffered raw s16le to one float waveform, then feed in
-		// fixed-size chunks so partials update at ~0.5s granularity.
+		// Merge new audio into the accumulator.
+		pcmAccumulator = Buffer.concat([pcmAccumulator, audioBuf]);
+		audioBuf = Buffer.alloc(0);
+
 		const bytesPerSample = 2;
-		const samplesAvailable = Math.floor(audioBuf.length / bytesPerSample) * bytesPerSample;
-		if (samplesAvailable === 0) return;
+		const availBytes = Math.floor(pcmAccumulator.length / bytesPerSample) * bytesPerSample;
+		const availSamples = availBytes / bytesPerSample;
+		// Feature extractor needs ~39 frames (12480 samples) minimum.
+		if (availSamples < MIN_FEED_SAMPLES) return;
 
-		const floatChunk = new Float32Array(samplesAvailable / bytesPerSample);
-		for (let i = 0; i < floatChunk.length; i++) {
-			floatChunk[i] = audioBuf.readInt16LE(i * bytesPerSample) / 32768;
+		// Convert the accumulated s16le to Float32Array.
+		const floatChunk = new Float32Array(availSamples);
+		for (let i = 0; i < availSamples; i++) {
+			floatChunk[i] = pcmAccumulator.readInt16LE(i * bytesPerSample) / 32768;
 		}
-		audioBuf = audioBuf.subarray(samplesAvailable);
+		pcmAccumulator = pcmAccumulator.subarray(availBytes);
 
-		for (let fed = 0; fed < floatChunk.length; fed += FEED_CHUNK) {
+		// Feed in ~0.5s chunks, decoding each to get partials.
+		for (let fed = 0; fed < availSamples; fed += FEED_CHUNK) {
 			const piece = floatChunk.subarray(fed, fed + FEED_CHUNK);
 			if (piece.length === 0) continue;
-			stream.acceptWaveform({ sampleRate: SAMPLE_RATE, samples: piece });
-			recognizer.decode(stream);
-
-			// Endpoint = the recognizer finalized the current utterance.
-			if (recognizer.isEndpoint(stream)) {
-				// Flush the buffered audio into a final result before reading it.
-				stream.inputFinished();
+			try {
+				stream.acceptWaveform({ sampleRate: SAMPLE_RATE, samples: piece });
 				recognizer.decode(stream);
-				const result = recognizer.getResult(stream);
-				if (result?.text) {
-					segments.push(normalizeTranscript(result.text));
-				}
-				currentPartial = "";
-				stream = recognizer.createStream();
-				component?.update(displayText());
-				continue;
-			}
 
-			const result = recognizer.getResult(stream);
-			const partial = (result?.text ?? "") as string;
-			if (partial !== currentPartial) {
-				currentPartial = partial;
-				component?.update(displayText());
+				const result = recognizer.getResult(stream);
+				const partial = (result?.text ?? "") as string;
+				if (partial !== currentPartial) {
+					currentPartial = partial;
+					component?.update(displayText());
+				}
+			} catch {
+				// Sherpa C++ errors (e.g. feature extractor underrun) are
+				// non-fatal; just skip this chunk and continue.
 			}
 		}
 
@@ -232,11 +230,18 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function startMicCapture(): void {
-		child = spawn("pw-record", ["--rate", "16000", "--channels", "1", "--format", "s16", "-"], {
+		child = spawn("arecord", [
+			"-D", "default",
+			"-r", "16000",
+			"-c", "1",
+			"-f", "S16_LE",
+			"-t", "raw",
+			"-",
+		], {
 			stdio: ["ignore", "pipe", "ignore"],
 		});
 		child.on("error", (err) => {
-			uiCtx?.ui.notify(`Dictation: failed to start pw-record: ${err.message}`, "error");
+			uiCtx?.ui.notify(`Dictation: failed to start arecord: ${err.message}`, "error");
 			cancelRecording();
 		});
 		child.stdout?.on("data", (chunk: Buffer) => {
@@ -283,7 +288,7 @@ export default function (pi: ExtensionAPI) {
 						debug: 0,
 						provider: "cpu",
 					},
-					enableEndpoint: true,
+					enableEndpoint: false,
 					rule1MinTrailingSilence: 2.4,
 					rule2MinTrailingSilence: 1.2,
 					rule3MinUtteranceLength: 20,
@@ -301,6 +306,7 @@ export default function (pi: ExtensionAPI) {
 		currentPartial = "";
 		stream = recognizer.createStream();
 		audioBuf = Buffer.alloc(0);
+		pcmAccumulator = Buffer.alloc(0);
 
 		// Test hook: read a wav in chunks instead of the mic.
 		if (process.env.PI_DICTATION_SOURCE_FILE) {
@@ -317,31 +323,30 @@ export default function (pi: ExtensionAPI) {
 			const feedMs = Number(process.env.PI_DICTATION_TEST_FEED_MS ?? 150);
 			drainTimer = setInterval(() => {
 				if (!recording || !stream) return;
-				const end = Math.min(offset + FEED_CHUNK, samples.length);
+				const end = Math.min(offset + MIN_FEED_SAMPLES, samples.length);
 				const piece = samples.subarray(offset, end);
 				if (piece.length > 0) {
 					stream.acceptWaveform({ sampleRate: SAMPLE_RATE, samples: piece });
 					recognizer.decode(stream);
-					if (recognizer.isEndpoint(stream)) {
-						stream.inputFinished();
-						recognizer.decode(stream);
-						const result = recognizer.getResult(stream);
-						if (result?.text) segments.push(normalizeTranscript(result.text));
-						currentPartial = "";
-						stream = recognizer.createStream();
-					} else {
-						const result = recognizer.getResult(stream);
-						const partial = (result?.text ?? "") as string;
-						if (partial !== currentPartial) {
-							currentPartial = partial;
-						}
+				if (recognizer.isEndpoint(stream)) {
+					stream.inputFinished();
+					recognizer.decode(stream);
+					const result = recognizer.getResult(stream);
+					if (result?.text) segments.push(normalizeTranscript(result.text));
+					currentPartial = "";
+					stream = recognizer.createStream();
+				} else {
+					const result = recognizer.getResult(stream);
+					const partial = (result?.text ?? "") as string;
+					if (partial !== currentPartial) {
+						currentPartial = partial;
 					}
+				}
 					component?.update(displayText());
 					offset = end;
 				}
 				if (end >= samples.length) {
 					if (stream) {
-						// Flush trailing audio into the final segment before committing.
 						stream.inputFinished();
 						recognizer.decode(stream);
 						const result = recognizer.getResult(stream);
@@ -365,6 +370,7 @@ export default function (pi: ExtensionAPI) {
 			component = new DictationComponent(tui, (r) => done(r));
 			return component;
 		});
+
 		// Custom UI closed: recording stopped.
 		recording = false;
 		cleanupCapture();
@@ -372,8 +378,6 @@ export default function (pi: ExtensionAPI) {
 		if (result === RESULT_COMMIT || result === undefined) {
 			const text = normalizeTranscript(transcriptText());
 			(globalThis as any).__dictationDebug?.onCommit?.(result, segments, currentPartial);
-			// showExtensionCustom restores the editor to its pre-dictation text;
-			// append the transcript after it.
 			if (text) {
 				const base = ctx.ui.getEditorText();
 				const next = base ? `${base} ${text}` : text;
@@ -381,24 +385,17 @@ export default function (pi: ExtensionAPI) {
 				(globalThis as any).__dictationDebug?.afterSetEditorText?.(next, ctx.ui.getEditorText());
 			}
 		}
-		// RESULT_CANCEL → editor already restored, nothing appended.
 	}
 
 	function cancelRecording(): void {
 		if (!recording) return;
 		recording = false;
 		cleanupCapture();
-		// Closing the custom surface (as a cancel) restores the editor as-is.
 		component?.handleInput("escape");
 	}
 
 	const toggle = async (ctx: ExtensionContext) => {
-		if (recording) {
-			// The recording surface is already focused and handles stop keys,
-			// so a toggle press while recording only matters when the custom
-			// surface errored out; otherwise it's a no-op here.
-			return;
-		}
+		if (recording) return;
 		await beginRecording(ctx);
 	};
 
