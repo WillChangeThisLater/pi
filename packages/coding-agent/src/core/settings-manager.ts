@@ -132,6 +132,7 @@ export interface Settings {
 	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
 	outputPad?: 0 | 1; // Horizontal padding for chat message output (default: 1)
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
+	viMode?: boolean; // Enable basic vi editing in the prompt editor (set -o vi style, default: false)
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
 	markdown?: MarkdownSettings;
 	warnings?: WarningSettings;
@@ -1335,6 +1336,10 @@ export class SettingsManager {
 
 	getAutocompleteMaxVisible(): number {
 		return this.settings.autocompleteMaxVisible ?? 5;
+	}
+
+	getViMode(): boolean {
+		return this.settings.viMode ?? false;
 	}
 
 	setAutocompleteMaxVisible(maxVisible: number): void {
