@@ -39,6 +39,16 @@ export class CustomEditor extends Editor {
 			return;
 		}
 
+		// Vi mode: Escape in insert mode switches to normal mode instead of
+		// interrupting, so vi commands become available. With a completion
+		// menu open, Escape still cancels it (handled below).
+		if (this.isViModeEnabled() && this.getViMode() === "insert" && this.keybindings.matches(data, "app.interrupt")) {
+			if (!this.isShowingAutocomplete()) {
+				this.enterViNormalMode();
+				return;
+			}
+		}
+
 		// Check app keybindings first
 
 		// Escape/interrupt - only if autocomplete is NOT active
