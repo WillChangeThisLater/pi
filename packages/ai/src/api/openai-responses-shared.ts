@@ -17,6 +17,7 @@ import { calculateCost } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
+	AudioContent,
 	Context,
 	ImageContent,
 	Model,
@@ -27,6 +28,7 @@ import type {
 	Tool,
 	ToolCall,
 	Usage,
+	VideoContent,
 } from "../types.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
@@ -76,14 +78,24 @@ type ToolResultOutputContent = Array<ResponseInputText | ResponseInputImage>;
 
 function convertToolResultOutput<TApi extends Api>(
 	model: Model<TApi>,
-	content: readonly (TextContent | ImageContent)[],
+	content: readonly (TextContent | ImageContent | VideoContent | AudioContent)[],
 ): string | ToolResultOutputContent {
 	const textResult = content
 		.filter((c): c is TextContent => c.type === "text")
 		.map((c) => c.text)
 		.join("\n");
 	const images = content.filter((c): c is ImageContent => c.type === "image");
+	const videos = content.filter((c): c is VideoContent => c.type === "video");
+	const audios = content.filter((c): c is AudioContent => c.type === "audio");
 	const hasText = textResult.length > 0;
+
+	if (videos.length > 0 && !hasText && images.length === 0) {
+		return sanitizeSurrogates("(see attached video)");
+	}
+
+	if (audios.length > 0 && !hasText && images.length === 0 && videos.length === 0) {
+		return sanitizeSurrogates("(see attached audio)");
+	}
 
 	if (images.length === 0 || !model.input.includes("image")) {
 		return sanitizeSurrogates(hasText ? textResult : images.length > 0 ? "(see attached image)" : "(no tool output)");

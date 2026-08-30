@@ -1089,9 +1089,16 @@ async function fetchOpenRouterModels(): Promise<Model<any>[]> {
 			modelKey = model.id; // Keep full ID for OpenRouter
 
 			// Parse input modalities
-			const input: ("text" | "image")[] = ["text"];
-			if (model.architecture?.modality?.includes("image")) {
+			const input: ("text" | "image" | "video" | "audio")[] = ["text"];
+			const inputModality = model.architecture?.modality?.split("->")[0] ?? "";
+			if (inputModality.includes("image")) {
 				input.push("image");
+			}
+			if (inputModality.includes("video")) {
+				input.push("video");
+			}
+			if (inputModality.includes("audio")) {
+				input.push("audio");
 			}
 
 			// Convert pricing from $/token to $/million tokens
@@ -1373,9 +1380,11 @@ function processFireworksModels(provider: ModelsDevProvider | undefined): Model<
 	for (const [modelId, model] of Object.entries(provider.models)) {
 		if (model.tool_call !== true) continue;
 
-		const input: ("text" | "image")[] = model.modalities?.input?.includes("image")
-			? ["text", "image"]
-			: ["text"];
+		const inputMods = model.modalities?.input ?? [];
+		const input: ("text" | "image" | "video" | "audio")[] = ["text"];
+		if (inputMods.includes("image")) input.push("image");
+		if (inputMods.includes("video")) input.push("video");
+		if (inputMods.includes("audio")) input.push("audio");
 		const common = {
 			id: modelId,
 			name: model.name || modelId,
@@ -1461,7 +1470,14 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					provider: "amazon-bedrock" as const,
 					baseUrl: getBedrockBaseUrl(id),
 					reasoning: m.reasoning === true,
-					input: (m.modalities?.input?.includes("image") ? ["text", "image"] : ["text"]) as ("text" | "image")[],
+					input: ((): ("text" | "image" | "video" | "audio")[] => {
+					const mods = m.modalities?.input ?? [];
+					const input: ("text" | "image" | "video" | "audio")[] = ["text"];
+					if (mods.includes("image")) input.push("image");
+					if (mods.includes("video")) input.push("video");
+					if (mods.includes("audio")) input.push("audio");
+					return input;
+				})(),
 					cost: {
 						input: m.cost?.input || 0,
 						output: m.cost?.output || 0,

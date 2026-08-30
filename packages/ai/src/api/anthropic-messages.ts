@@ -12,6 +12,7 @@ import type {
 	AnthropicMessagesCompat,
 	Api,
 	AssistantMessage,
+	AudioContent,
 	CacheRetention,
 	Context,
 	ImageContent,
@@ -28,6 +29,7 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
+	VideoContent,
 } from "../types.ts";
 import { splitDeferredTools } from "../utils/deferred-tools.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
@@ -115,7 +117,7 @@ const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 /**
  * Convert content blocks to Anthropic API format
  */
-function convertContentBlocks(content: (TextContent | ImageContent)[]):
+function convertContentBlocks(content: (TextContent | ImageContent | VideoContent | AudioContent)[]):
 	| string
 	| Array<
 			| { type: "text"; text: string }
@@ -140,6 +142,20 @@ function convertContentBlocks(content: (TextContent | ImageContent)[]):
 			return {
 				type: "text" as const,
 				text: sanitizeSurrogates(block.text),
+			};
+		}
+		if (block.type === "video") {
+			// Video blocks are downgraded to a placeholder; Anthropic does not accept video input.
+			return {
+				type: "text" as const,
+				text: `[video:${block.mimeType} omitted: not supported by this API]`,
+			};
+		}
+		if (block.type === "audio") {
+			// Audio blocks are downgraded to a placeholder; Anthropic does not accept audio input.
+			return {
+				type: "text" as const,
+				text: `[audio:${block.mimeType} omitted: not supported by this API]`,
 			};
 		}
 		return {

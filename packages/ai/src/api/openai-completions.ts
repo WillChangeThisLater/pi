@@ -129,6 +129,46 @@ function isImageContentBlock(block: { type: string }): block is ImageContent {
 	return block.type === "image";
 }
 
+/**
+ * Map an audio MIME type to an OpenRouter/OpenAI `input_audio` format string.
+ * Defaults to "wav" for unknown types.
+ */
+function audioFormatForMimeType(mimeType: string): string {
+	const normalized = mimeType.toLowerCase().split(";")[0].trim();
+	switch (normalized) {
+		case "audio/wav":
+		case "audio/x-wav":
+		case "audio/wave":
+		case "audio/vnd.wave":
+			return "wav";
+		case "audio/mpeg":
+		case "audio/mp3":
+			return "mp3";
+		case "audio/aiff":
+		case "audio/x-aiff":
+			return "aiff";
+		case "audio/aac":
+			return "aac";
+		case "audio/ogg":
+		case "application/ogg":
+			return "ogg";
+		case "audio/flac":
+		case "audio/x-flac":
+			return "flac";
+		case "audio/mp4":
+		case "audio/m4a":
+		case "audio/x-m4a":
+			return "m4a";
+		case "audio/L16":
+		case "audio/pcm":
+			return "pcm16";
+		case "audio/L24":
+			return "pcm24";
+		default:
+			return "wav";
+	}
+}
+
 function isReasoningDetailObject(detail: unknown): detail is Record<string, unknown> {
 	return typeof detail === "object" && detail !== null && !Array.isArray(detail);
 }
@@ -1234,14 +1274,34 @@ export function convertMessages(
 							type: "text",
 							text: sanitizeSurrogates(item.text),
 						} satisfies ChatCompletionContentPartText;
-					} else {
+					}
+					if (item.type === "video") {
+						// OpenRouter-style video input part. Only models that declare video
+						// input support accept this; other providers reject the request.
 						return {
-							type: "image_url",
-							image_url: {
+							type: "video_url",
+							video_url: {
 								url: `data:${item.mimeType};base64,${item.data}`,
 							},
-						} satisfies ChatCompletionContentPartImage;
+						} as unknown as ChatCompletionContentPartImage;
 					}
+					if (item.type === "audio") {
+						// OpenRouter-style audio input part. Only models that declare audio
+						// input support accept this; other providers reject the request.
+						return {
+							type: "input_audio",
+							input_audio: {
+								data: item.data,
+								format: audioFormatForMimeType(item.mimeType),
+							},
+						} as unknown as ChatCompletionContentPartImage;
+					}
+					return {
+						type: "image_url",
+						image_url: {
+							url: `data:${item.mimeType};base64,${item.data}`,
+						},
+					} satisfies ChatCompletionContentPartImage;
 				});
 				if (content.length === 0) continue;
 				params.push({

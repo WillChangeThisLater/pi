@@ -1,23 +1,42 @@
 import type {
 	Api,
 	AssistantMessage,
+	AudioContent,
 	ImageContent,
 	Message,
 	Model,
 	TextContent,
 	ToolCall,
 	ToolResultMessage,
+	VideoContent,
 } from "../types.ts";
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
+const NON_VIDEO_USER_PLACEHOLDER = "(video omitted: model does not support video input)";
+const NON_AUDIO_USER_PLACEHOLDER = "(audio omitted: model does not support audio input)";
+const NON_VIDEO_TOOL_PLACEHOLDER = "(tool video omitted: model does not support video input)";
+const NON_AUDIO_TOOL_PLACEHOLDER = "(tool audio omitted: model does not support audio input)";
 
-function replaceImagesWithPlaceholder(content: (TextContent | ImageContent)[], placeholder: string): TextContent[] {
-	const result: TextContent[] = [];
+type UnsupportedMediaPlaceholders = { image?: string; video?: string; audio?: string };
+
+function replaceUnsupportedMediaWithPlaceholder(
+	content: (TextContent | ImageContent | VideoContent | AudioContent)[],
+	placeholders: UnsupportedMediaPlaceholders,
+): (TextContent | ImageContent | VideoContent | AudioContent)[] {
+	const result: (TextContent | ImageContent | VideoContent | AudioContent)[] = [];
 	let previousWasPlaceholder = false;
 
 	for (const block of content) {
-		if (block.type === "image") {
+		const placeholder =
+			block.type === "image"
+				? placeholders.image
+				: block.type === "video"
+					? placeholders.video
+					: block.type === "audio"
+						? placeholders.audio
+						: undefined;
+		if (placeholder) {
 			if (!previousWasPlaceholder) {
 				result.push({ type: "text", text: placeholder });
 			}
@@ -26,29 +45,44 @@ function replaceImagesWithPlaceholder(content: (TextContent | ImageContent)[], p
 		}
 
 		result.push(block);
-		previousWasPlaceholder = block.text === placeholder;
+		previousWasPlaceholder =
+			block.type === "text" && (block.text === placeholders.image || block.text === placeholders.video);
 	}
 
 	return result;
 }
 
-function downgradeUnsupportedImages<TApi extends Api>(messages: Message[], model: Model<TApi>): Message[] {
-	if (model.input.includes("image")) {
+function downgradeUnsupportedMedia<TApi extends Api>(messages: Message[], model: Model<TApi>): Message[] {
+	const supportsImage = model.input.includes("image");
+	const supportsVideo = model.input.includes("video");
+	const supportsAudio = model.input.includes("audio");
+	if (supportsImage && supportsVideo && supportsAudio) {
 		return messages;
 	}
+
+	const userPlaceholders: UnsupportedMediaPlaceholders = {
+		...(supportsImage ? {} : { image: NON_VISION_USER_IMAGE_PLACEHOLDER }),
+		...(supportsVideo ? {} : { video: NON_VIDEO_USER_PLACEHOLDER }),
+		...(supportsAudio ? {} : { audio: NON_AUDIO_USER_PLACEHOLDER }),
+	};
+	const toolPlaceholders: UnsupportedMediaPlaceholders = {
+		...(supportsImage ? {} : { image: NON_VISION_TOOL_IMAGE_PLACEHOLDER }),
+		...(supportsVideo ? {} : { video: NON_VIDEO_TOOL_PLACEHOLDER }),
+		...(supportsAudio ? {} : { audio: NON_AUDIO_TOOL_PLACEHOLDER }),
+	};
 
 	return messages.map((msg) => {
 		if (msg.role === "user" && Array.isArray(msg.content)) {
 			return {
 				...msg,
-				content: replaceImagesWithPlaceholder(msg.content, NON_VISION_USER_IMAGE_PLACEHOLDER),
+				content: replaceUnsupportedMediaWithPlaceholder(msg.content, userPlaceholders),
 			};
 		}
 
 		if (msg.role === "toolResult") {
 			return {
 				...msg,
-				content: replaceImagesWithPlaceholder(msg.content, NON_VISION_TOOL_IMAGE_PLACEHOLDER),
+				content: replaceUnsupportedMediaWithPlaceholder(msg.content, toolPlaceholders),
 			};
 		}
 
@@ -71,7 +105,7 @@ export function transformMessages<TApi extends Api>(
 	// Normalize null/undefined content from untyped callers (custom tools, hand-built
 	// histories, old session files) so downstream code can rely on the type contract.
 	const normalizedMessages = messages.map((msg) => (msg.content == null ? { ...msg, content: [] } : msg));
-	const imageAwareMessages = downgradeUnsupportedImages(normalizedMessages, model);
+	const imageAwareMessages = downgradeUnsupportedMedia(normalizedMessages, model);
 
 	// First pass: transform messages (unsupported image downgrade, thinking blocks, tool call ID normalization)
 	const transformed = imageAwareMessages.map((msg) => {
