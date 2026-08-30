@@ -23,7 +23,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { isKeyRelease, isKittyProtocolActive } from "@earendil-works/pi-tui";
+import {
+	isKeyRelease,
+	isKeyRepeat,
+	isKittyProtocolActive,
+	matchesKey,
+} from "@earendil-works/pi-tui";
 
 const SAMPLE_RATE = 16000;
 const ARECORD_ARGS = ["-r", String(SAMPLE_RATE), "-c", "1", "-f", "S16_LE", "-t", "raw", "-"];
@@ -174,14 +179,14 @@ class DictationSession {
 			try {
 				const wav = fs.readFileSync(this.sourceFile);
 				const text = normalizeTranscript(await this.transcribe(wav));
-				this.commit(text);
+				this.finalize(text);
 			} catch (e) {
 				this.fail(e);
 			}
 			return;
 		}
 
-		this.arecord = spawn("arecord", ["-D", process.env.PI_DICTATION_DEVICE ?? "default", ...ARECORD_ARGS.slice(1)], {
+		this.arecord = spawn("arecord", ["-D", process.env.PI_DICTATION_DEVICE ?? "default", ...ARECORD_ARGS], {
 			stdio: ["ignore", "pipe", "ignore"],
 		});
 		this.arecord.stdout?.on("data", (chunk: Buffer) => this.pcmChunks.push(chunk));
@@ -212,6 +217,7 @@ class DictationSession {
 		this.runInFlight = true;
 		try {
 			const text = await this.transcribe(pcmToWav(this.pcmSoFar()));
+			this.log("partial", text || "(empty)");
 			if (text && text !== this.lastPartial) {
 				this.lastPartial = text;
 				this.applyEditor(text);
@@ -248,10 +254,10 @@ class DictationSession {
 				return;
 			}
 		}
-		this.commit(text);
+		this.finalize(text);
 	}
 
-	private commit(text: string): void {
+	private finalize(text: string): void {
 		this.stopCapture();
 		this.log("commit", text || "(silence)");
 		if (text) this.applyEditor(text);
@@ -299,40 +305,72 @@ export default function (pi: ExtensionAPI) {
 	let inputBound = false;
 	let holdStarting: Promise<DictationSession | null> | null = null;
 
+	/** Classify a space-bar event from raw terminal input, or null if not space. */
+	function spaceEvent(data: string): "press" | "repeat" | "release" | null {
+		if (data === " " || matchesKey(data, "space")) return "press";
+		// Kitty CSI-u repeats/releases carry codepoint 32, e.g. \x1b[32;1:2u / \x1b[32;1:3u.
+		if (isKeyRepeat(data) && data.includes("\x1b[32")) return "repeat";
+		if (isKeyRelease(data) && data.includes("\x1b[32")) return "release";
+		return null;
+	}
+
+	function startHold(ctx: ExtensionContext): void {
+		holdStarting = DictationSession.start(ctx)
+			.then((s) => {
+				session = s;
+				return s;
+			})
+			.catch(() => null);
+	}
+
+	function releaseHold(): void {
+		const starting = holdStarting;
+		holdStarting = null;
+		if (starting) {
+			void starting.then((s) => {
+				session = null;
+				void s?.commit();
+			});
+		} else if (session) {
+			const s = session;
+			session = null;
+			void s.commit();
+		}
+	}
+
 	// Hold-to-talk: with the Kitty keyboard protocol active, space press starts
 	// dictation and space release commits it (Claude Code convention). Space is
-	// therefore dedicated to dictation in those terminals.
+	// dedicated to dictation only while a session is active.
+	//
+	// Without the Kitty protocol (e.g. pi inside tmux) terminals send no release
+	// events, so true hold-to-talk is impossible. Fallback: once a session is
+	// active (started via /dictate, ctrl+space, or alt+space), space presses are
+	// consumed and the first press commits (press-to-talk).
 	function handleTerminalInput(data: string): { consume?: boolean } | undefined {
-		if (!isKittyProtocolActive()) return undefined;
+		const space = spaceEvent(data);
+		if (!space) return undefined;
 
-		// Space press (and key-repeat while held).
-		if (data === " ") {
-			if (session || holdStarting) return { consume: true }; // ignore repeats
-			const ctx = lastCtx;
-			if (!ctx) return undefined;
-			holdStarting = DictationSession.start(ctx)
-				.then((s) => {
-					session = s;
-					return s;
-				})
-				.catch(() => null);
-			return { consume: true };
+		if (isKittyProtocolActive()) {
+			switch (space) {
+				case "press":
+					if (session || holdStarting) return { consume: true }; // ignore repeats-as-press
+					if (!lastCtx) return undefined;
+					startHold(lastCtx);
+					return { consume: true };
+				case "repeat":
+					return session || holdStarting ? { consume: true } : undefined;
+				case "release":
+					if (!session && !holdStarting) return undefined;
+					releaseHold();
+					return { consume: true };
+			}
 		}
 
-		// Space release (kitty CSI-u: codepoint 32 with event type :3).
-		if (isKeyRelease(data) && data.includes("\x1b[32;")) {
-			const starting = holdStarting;
-			holdStarting = null;
-			if (starting) {
-				void starting.then((s) => {
-					session = null;
-					void s?.commit();
-				});
-			} else if (session) {
-				const s = session;
-				session = null;
-				void s.commit();
-			}
+		// Non-kitty fallback: press-to-talk commit while a session is active.
+		if (space === "press" && session) {
+			const s = session;
+			session = null;
+			void s.commit();
 			return { consume: true };
 		}
 
