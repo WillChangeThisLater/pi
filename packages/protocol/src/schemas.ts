@@ -63,7 +63,9 @@ export const ModelMetadataSchema = StrictObject({
 	name: Type.String({ minLength: 1 }),
 	api: IdSchema,
 	reasoning: Type.Boolean(),
-	input: Type.Array(Type.Union([Type.Literal("text"), Type.Literal("image")])),
+	input: Type.Array(
+		Type.Union([Type.Literal("text"), Type.Literal("image"), Type.Literal("video"), Type.Literal("audio")]),
+	),
 	contextWindow: Type.Integer({ minimum: 1 }),
 	maxTokens: Type.Integer({ minimum: 1 }),
 	cost: ModelCostSchema,
@@ -86,18 +88,40 @@ export const ImageContentSchema = StrictObject({
 	data: Type.String(),
 	mimeType: Type.String({ minLength: 1 }),
 });
+export const VideoContentSchema = StrictObject({
+	type: Type.Literal("video"),
+	data: Type.String(),
+	mimeType: Type.String({ minLength: 1 }),
+});
+export const AudioContentSchema = StrictObject({
+	type: Type.Literal("audio"),
+	data: Type.String(),
+	mimeType: Type.String({ minLength: 1 }),
+});
 export const ToolCallContentSchema = StrictObject({
 	type: Type.Literal("toolCall"),
 	toolCallId: IdSchema,
 	toolName: IdSchema,
 	input: JsonValueSchema,
 });
-export const UserContentSchema = Type.Union([TextContentSchema, ImageContentSchema]);
+export const UserContentSchema = Type.Union([
+	TextContentSchema,
+	ImageContentSchema,
+	VideoContentSchema,
+	AudioContentSchema,
+]);
 export const AssistantContentSchema = Type.Union([TextContentSchema, ThinkingContentSchema, ToolCallContentSchema]);
-export const ToolContentSchema = Type.Union([TextContentSchema, ImageContentSchema]);
+export const ToolContentSchema = Type.Union([
+	TextContentSchema,
+	ImageContentSchema,
+	VideoContentSchema,
+	AudioContentSchema,
+]);
 export type TextContent = Static<typeof TextContentSchema>;
 export type ThinkingContent = Static<typeof ThinkingContentSchema>;
 export type ImageContent = Static<typeof ImageContentSchema>;
+export type VideoContent = Static<typeof VideoContentSchema>;
+export type AudioContent = Static<typeof AudioContentSchema>;
 export type ToolCallContent = Static<typeof ToolCallContentSchema>;
 
 export const UsageSchema = StrictObject({
