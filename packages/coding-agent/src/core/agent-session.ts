@@ -1067,8 +1067,16 @@ export class AgentSession {
 		const loadedSkills = this._resourceLoader.getSkills().skills;
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
+		const model = this.agent.state.model;
 		this._baseSystemPromptOptions = {
 			cwd: this._cwd,
+			model: model
+				? {
+						provider: model.provider,
+						id: model.id,
+						inputMedia: model.input.filter((m) => m !== "text"),
+					}
+				: undefined,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
@@ -1655,6 +1663,34 @@ export class AgentSession {
 		// Per-model thinking level overrides take priority over the global default.
 		// Model persistence does not implicitly rewrite the global thinking default.
 		this.setThinkingLevel(thinkingLevel);
+
+		// Rebuild the system prompt so the model identity section reflects the new model.
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;
+
+		// Inform the model about the switch on its next turn so in-context knowledge
+		// of the active model and its media capabilities stays current.
+		if (previousModel && !modelsAreEqual(previousModel, model)) {
+			const mediaList = model.input.filter((m) => m !== "text");
+			await this.sendCustomMessage(
+				{
+					customType: "pi.model_change",
+					content:
+						`[Model switched: ${previousModel.provider}/${previousModel.id} -> ${model.provider}/${model.id}. ` +
+						`Per pi's model registry, this model's input media: ${
+							mediaList.length > 0 ? mediaList.join(", ") : "text only"
+						}; treat this as a best guess.]`,
+					display: true,
+					details: {
+						previousProvider: previousModel.provider,
+						previousModelId: previousModel.id,
+						provider: model.provider,
+						modelId: model.id,
+					},
+				},
+				{ deliverAs: "nextTurn" },
+			);
+		}
 
 		await this._emitModelSelect(model, previousModel, "set");
 	}
