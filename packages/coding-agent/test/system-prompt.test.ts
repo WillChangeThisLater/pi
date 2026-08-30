@@ -26,6 +26,46 @@ describe("buildSystemPrompt", () => {
 		});
 	});
 
+	describe("model identity", () => {
+		test("injects provider/model and input media when provided", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: [],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+				model: { provider: "z-ai", id: "glm-5.3-flash", inputMedia: ["image", "video"] },
+			});
+
+			expect(prompt).toContain("you are z-ai/glm-5.3-flash");
+			expect(prompt).toContain("input media: image, video");
+			expect(prompt).toContain("best guess");
+		});
+
+		test("falls back to text when no non-text media", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: [],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+				model: { provider: "openai", id: "gpt-4o-mini", inputMedia: [] },
+			});
+
+			expect(prompt).toContain("you are openai/gpt-4o-mini");
+			expect(prompt).toContain("input media: text");
+		});
+
+		test("omits identity section when no model provided", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: [],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).not.toContain("Model identity");
+		});
+	});
+
 	describe("default tools", () => {
 		test("includes all default tools when snippets are provided", () => {
 			const prompt = buildSystemPrompt({
