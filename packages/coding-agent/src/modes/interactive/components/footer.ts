@@ -5,6 +5,7 @@ import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
 import { addUsageToTotals, createUsageTotals } from "../../../core/usage-totals.ts";
 import { theme } from "../theme/theme.ts";
+import { modalityIconsFor } from "./modality-icons.ts";
 
 /**
  * Sanitize text for display in a single-line status.
@@ -191,6 +192,12 @@ export class FooterComponent implements Component {
 			const thinkingLevel = state.thinkingLevel || "off";
 			rightSideWithoutProvider =
 				thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+		}
+
+		// Add input modality icons: picture, audio, video support
+		const modalityIcons = modalityIconsFor(state.model?.input);
+		if (modalityIcons) {
+			rightSideWithoutProvider = `${rightSideWithoutProvider} ${modalityIcons}`;
 		}
 
 		// Prepend the provider in parentheses if there are multiple providers and there's enough room

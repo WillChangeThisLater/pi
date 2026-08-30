@@ -6,7 +6,7 @@
  */
 
 import { createInterface } from "node:readline";
-import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
+import { type AudioContent, type ImageContent, modelsAreEqual, type VideoContent } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { type Args, type Mode, normalizeSessionName, parseArgs, printHelp } from "./cli/args.ts";
@@ -212,17 +212,17 @@ async function prepareInitialMessage(
 	stdinContent?: string,
 ): Promise<{
 	initialMessage?: string;
-	initialImages?: ImageContent[];
+	initialImages?: (ImageContent | VideoContent | AudioContent)[];
 }> {
 	if (parsed.fileArgs.length === 0) {
 		return buildInitialMessage({ parsed, stdinContent });
 	}
 
-	const { text, images } = await processFileArguments(parsed.fileArgs, { autoResizeImages });
+	const { text, images, videos, audios } = await processFileArguments(parsed.fileArgs, { autoResizeImages });
 	return buildInitialMessage({
 		parsed,
 		fileText: text,
-		fileImages: images,
+		fileImages: [...images, ...videos, ...audios],
 		stdinContent,
 	});
 }

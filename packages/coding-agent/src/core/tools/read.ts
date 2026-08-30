@@ -9,7 +9,11 @@ import { getReadmePath } from "../../config.ts";
 import { keyHint, keyText } from "../../modes/interactive/components/keybinding-hints.ts";
 import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
 import { processImage } from "../../utils/image-process.ts";
-import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
+import {
+	detectSupportedAudioMimeTypeFromFile,
+	detectSupportedImageMimeTypeFromFile,
+	detectSupportedVideoMimeTypeFromFile,
+} from "../../utils/mime.ts";
 import { formatPathRelativeToCwdOrAbsolute } from "../../utils/paths.ts";
 import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
@@ -251,6 +255,37 @@ export function createReadToolDefinition(
 							let content: (TextContent | ImageContent)[];
 							let details: ReadToolDetails | undefined;
 							const nonVisionImageNote = getNonVisionImageNote(ctx?.model);
+							if (!mimeType) {
+								// Detect media files (video/audio) and return an informative note instead of binary garbage.
+								const videoMimeType = await detectSupportedVideoMimeTypeFromFile(absolutePath).catch(
+									() => null,
+								);
+								if (videoMimeType) {
+									content = [
+										{
+											type: "text",
+											text: `Binary media file [${videoMimeType}]. The read tool cannot display video content. Ask the user to attach it with @${absolutePath} in their message so it is sent to the model directly.`,
+										},
+									];
+									details = { truncation: undefined };
+									resolve({ content, details });
+									return;
+								}
+								const audioMimeType = await detectSupportedAudioMimeTypeFromFile(absolutePath).catch(
+									() => null,
+								);
+								if (audioMimeType) {
+									content = [
+										{
+											type: "text",
+											text: `Binary media file [${audioMimeType}]. The read tool cannot display audio content. Ask the user to attach it with @${absolutePath} in their message so it is sent to the model directly.`,
+										},
+									];
+									details = { truncation: undefined };
+									resolve({ content, details });
+									return;
+								}
+							}
 							if (mimeType) {
 								// Read image as binary.
 								const buffer = await ops.readFile(absolutePath);

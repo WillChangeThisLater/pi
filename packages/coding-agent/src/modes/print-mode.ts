@@ -6,7 +6,7 @@
  * - `pi --mode json "prompt"` - JSON event stream
  */
 
-import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
+import type { AssistantMessage, AudioContent, ImageContent, VideoContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
@@ -23,7 +23,7 @@ export interface PrintModeOptions {
 	/** First message to send (may contain @file content) */
 	initialMessage?: string;
 	/** Images to attach to the initial message */
-	initialImages?: ImageContent[];
+	initialImages?: (ImageContent | VideoContent | AudioContent)[];
 }
 
 /**

@@ -27,12 +27,14 @@ import type {
 import { contentText } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
+	AudioContent,
 	AuthResult,
 	ImageContent,
 	Model,
 	ProviderHeaders,
 	TextContent,
 	Usage,
+	VideoContent,
 } from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
@@ -242,8 +244,8 @@ export interface ExtensionBindings {
 export interface PromptOptions {
 	/** Whether to dispatch extension commands and expand skill commands and prompt templates (default: true) */
 	expandPromptTemplates?: boolean;
-	/** Image attachments */
-	images?: ImageContent[];
+	/** Image (and video) attachments */
+	images?: (ImageContent | VideoContent | AudioContent)[];
 	/** When streaming, how to queue the message: "steer" (interrupt) or "followUp" (wait). Required if streaming. */
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
@@ -1237,7 +1239,9 @@ export class AgentSession {
 			messages = [];
 
 			// Add user message
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
+			const userContent: (TextContent | ImageContent | VideoContent | AudioContent)[] = [
+				{ type: "text", text: expandedText },
+			];
 			if (currentImages) {
 				userContent.push(...currentImages);
 			}
@@ -1361,10 +1365,10 @@ export class AgentSession {
 	 * Delivered after the current assistant turn finishes executing its tool calls,
 	 * before the next LLM call.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
-	 * @param images Optional image attachments to include with the message
+	 * @param images Optional image (or video) attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[]): Promise<void> {
+	async steer(text: string, images?: (ImageContent | VideoContent | AudioContent)[]): Promise<void> {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1381,10 +1385,10 @@ export class AgentSession {
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
-	 * @param images Optional image attachments to include with the message
+	 * @param images Optional image (or video) attachments to include with the message
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[]): Promise<void> {
+	async followUp(text: string, images?: (ImageContent | VideoContent | AudioContent)[]): Promise<void> {
 		// Check for extension commands (cannot be queued)
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -1400,10 +1404,10 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(text: string, images?: (ImageContent | VideoContent | AudioContent)[]): Promise<void> {
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		const content: (TextContent | ImageContent | VideoContent | AudioContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
@@ -1417,10 +1421,10 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(text: string, images?: (ImageContent | VideoContent | AudioContent)[]): Promise<void> {
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
-		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
+		const content: (TextContent | ImageContent | VideoContent | AudioContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
@@ -1528,12 +1532,12 @@ export class AgentSession {
 	 * @param options.expandPromptTemplates Whether to dispatch extension commands and expand skill commands and prompt templates. Default: false.
 	 */
 	async sendUserMessage(
-		content: string | (TextContent | ImageContent)[],
+		content: string | (TextContent | ImageContent | VideoContent | AudioContent)[],
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
-		let images: ImageContent[] | undefined;
+		let images: (ImageContent | VideoContent | AudioContent)[] | undefined;
 
 		if (typeof content === "string") {
 			text = content;

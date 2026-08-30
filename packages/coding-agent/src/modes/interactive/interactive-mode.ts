@@ -9,7 +9,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
-import type { AssistantMessage, ImageContent, Message, Model, Usage } from "@earendil-works/pi-ai/compat";
+import type {
+	AssistantMessage,
+	AudioContent,
+	ImageContent,
+	Message,
+	Model,
+	Usage,
+	VideoContent,
+} from "@earendil-works/pi-ai/compat";
 import type {
 	AutocompleteItem,
 	AutocompleteProvider,
@@ -46,6 +54,7 @@ import {
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import { spawn } from "child_process";
+import { processFileArguments } from "../../cli/file-processor.ts";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -345,7 +354,7 @@ export interface InteractiveModeOptions {
 	/** Initial message to send on startup (can include @file content) */
 	initialMessage?: string;
 	/** Images to attach to the initial message */
-	initialImages?: ImageContent[];
+	initialImages?: (ImageContent | VideoContent | AudioContent)[];
 	/** Additional messages to send after the initial message */
 	initialMessages?: string[];
 	/** Force verbose startup (overrides quietStartup setting) */
@@ -448,7 +457,7 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private onInputCallback?: (text: string) => void;
+	private onInputCallback?: (text: string, media?: (ImageContent | VideoContent | AudioContent)[]) => void;
 	private pendingUserInputs: string[] = [];
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private readonly idleStatus = new IdleStatus();
@@ -1181,9 +1190,9 @@ export class InteractiveMode {
 
 		// Main interactive loop
 		while (true) {
-			const userInput = await this.getUserInput();
+			const { text: userInput, media } = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				await this.session.prompt(userInput, { images: media });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -3137,17 +3146,23 @@ export class InteractiveMode {
 					this.editor.setText("");
 					await this.session.prompt(text);
 				} else {
-					this.queueCompactionMessage(text, "steer");
+					await this.expandFileReferences(text).then(({ text: expanded }) => {
+						this.queueCompactionMessage(expanded, "steer");
+					});
 				}
 				return;
 			}
+
+			// Expand @file references into inline text + media attachments
+			const { text: expandedText, media } = await this.expandFileReferences(text);
+			text = expandedText;
 
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			if (this.session.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await this.session.prompt(text, { images: media, streamingBehavior: "steer" });
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3158,7 +3173,7 @@ export class InteractiveMode {
 			this.flushPendingBashComponents();
 
 			if (this.onInputCallback) {
-				this.onInputCallback(text);
+				this.onInputCallback(text, media);
 			} else {
 				this.pendingUserInputs.push(text);
 			}
@@ -3888,16 +3903,76 @@ export class InteractiveMode {
 		);
 	}
 
-	async getUserInput(): Promise<string> {
+	/**
+	 * Extract @file references from user input, inline their text content, and
+	 * return media attachments for supported media (images/video/audio).
+	 * Returns the input unchanged when no @file references resolve.
+	 */
+	private async expandFileReferences(text: string): Promise<{
+		text: string;
+		media?: (ImageContent | VideoContent | AudioContent)[];
+	}> {
+		// Match @-prefixed tokens at word boundaries; supports quoted paths with spaces.
+		const matches = [...text.matchAll(/(?:^|[\s(])@("(?:[^"]*)"|[^\s,;)!?]+)/g)];
+		if (matches.length === 0) return { text };
+		const fileArgs: string[] = [];
+		for (const match of matches) {
+			let raw = match[1];
+			if (raw.startsWith('"') && raw.endsWith('"')) raw = raw.slice(1, -1);
+			// Only treat as a file reference if it resolves to an existing file on disk.
+			const candidate = raw.startsWith("~")
+				? path.join(os.homedir(), raw.slice(1))
+				: path.resolve(this.session.sessionManager.getCwd(), raw);
+			try {
+				await fs.promises.access(candidate);
+			} catch {
+				continue;
+			}
+			fileArgs.push(raw);
+		}
+		if (fileArgs.length === 0) return { text };
+		// Strip the @tokens from the prompt text.
+		let stripped = text;
+		for (const match of matches) {
+			const token = match[1];
+			stripped = stripped.replace(
+				new RegExp(`(^|[\\s(])@${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|[\\s,;)!?])`),
+				"g",
+			);
+		}
+		stripped = stripped.replace(/\s{2,}/g, " ").trim();
+		const {
+			text: fileText,
+			images,
+			videos,
+			audios,
+		} = await processFileArguments(fileArgs, {
+			autoResizeImages: this.settingsManager.getImageAutoResize(),
+			exitOnError: false,
+		});
+		const media: (ImageContent | VideoContent | AudioContent)[] = [];
+		if (images) media.push(...images);
+		if (videos) media.push(...videos);
+		if (audios) media.push(...audios);
+		return {
+			text: `${stripped}${fileText ? `\n${fileText}` : ""}`.trim(),
+			media: media.length > 0 ? media : undefined,
+		};
+	}
+
+	async getUserInput(): Promise<{
+		text: string;
+		media?: (ImageContent | VideoContent | AudioContent)[];
+	}> {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
-			return queuedInput;
+			return { text: queuedInput };
 		}
 
 		return new Promise((resolve) => {
-			this.onInputCallback = (text: string) => {
+			this.onInputCallback = (text: string, media?: (ImageContent | VideoContent | AudioContent)[]) => {
 				this.onInputCallback = undefined;
-				resolve(text);
+				resolve({ text, media });
 			};
 		});
 	}
@@ -4106,8 +4181,12 @@ export class InteractiveMode {
 	}
 
 	private async handleFollowUp(): Promise<void> {
-		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
+		let text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
 		if (!text) return;
+
+		// Expand @file references into inline text + media attachments
+		const { text: expandedText, media } = await this.expandFileReferences(text);
+		text = expandedText;
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
@@ -4126,7 +4205,7 @@ export class InteractiveMode {
 		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.session.prompt(text, { images: media, streamingBehavior: "followUp" });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}

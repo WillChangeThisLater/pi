@@ -19,6 +19,7 @@ import type {
 	Api,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
+	AudioContent,
 	ConstrainedSamplingConfig,
 	Context,
 	ImageContent,
@@ -32,6 +33,7 @@ import type {
 	TextContent,
 	ToolResultMessage,
 	Usage,
+	VideoContent,
 } from "@earendil-works/pi-ai";
 import type {
 	AutocompleteItem,
@@ -400,7 +402,7 @@ export interface ReplacedSessionContext extends ExtensionCommandContext {
 	): Promise<void>;
 
 	sendUserMessage(
-		content: string | (TextContent | ImageContent)[],
+		content: string | (TextContent | ImageContent | VideoContent | AudioContent)[],
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): Promise<void>;
 }
@@ -718,8 +720,8 @@ export interface BeforeAgentStartEvent {
 	type: "before_agent_start";
 	/** The raw user prompt text (after expansion). */
 	prompt: string;
-	/** Images attached to the user prompt, if any. */
-	images?: ImageContent[];
+	/** Images (and videos) attached to the user prompt, if any. */
+	images?: (ImageContent | VideoContent | AudioContent)[];
 	/** The fully assembled system prompt string. */
 	systemPrompt: string;
 	/** Structured options used to build the system prompt. Extensions can inspect this to understand what Pi loaded without re-discovering resources. */
@@ -868,8 +870,8 @@ export interface InputEvent {
 	type: "input";
 	/** The input text */
 	text: string;
-	/** Attached images, if any */
-	images?: ImageContent[];
+	/** Attached images (and videos), if any */
+	images?: (ImageContent | VideoContent | AudioContent)[];
 	/** Where the input came from */
 	source: InputSource;
 	/** How the input will be delivered during streaming, or undefined when idle */
@@ -879,7 +881,7 @@ export interface InputEvent {
 /** Result from input event handler */
 export type InputEventResult =
 	| { action: "continue" }
-	| { action: "transform"; text: string; images?: ImageContent[] }
+	| { action: "transform"; text: string; images?: (ImageContent | VideoContent | AudioContent)[] }
 	| { action: "handled" };
 
 // ============================================================================
@@ -1565,7 +1567,7 @@ export interface ProviderModelConfig {
 	/** Maps pi thinking levels to provider/model-specific values; null marks a level unsupported. */
 	thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
 	/** Supported input types. */
-	input: ("text" | "image")[];
+	input: ("text" | "image" | "video" | "audio")[];
 	/** Per-million-token cost rates and optional request-wide input pricing tiers. */
 	cost: Model<Api>["cost"];
 	/** Maximum context window size in tokens. */
