@@ -59,7 +59,7 @@ export interface ProviderConfigInput {
 		baseUrl?: string;
 		reasoning: boolean;
 		thinkingLevelMap?: Model<Api>["thinkingLevelMap"];
-		input: ("text" | "image")[];
+		input: ("text" | "image" | "video" | "audio")[];
 		cost: Model<Api>["cost"];
 		contextWindow: number;
 		maxTokens: number;
@@ -108,7 +108,7 @@ function applyModelOverride(model: Model<Api>, override: ModelsJsonModelOverride
 		thinkingLevelMap: override.thinkingLevelMap
 			? { ...model.thinkingLevelMap, ...override.thinkingLevelMap }
 			: model.thinkingLevelMap,
-		input: (override.input as ("text" | "image")[] | undefined) ?? model.input,
+		input: (override.input as ("text" | "image" | "video" | "audio")[] | undefined) ?? model.input,
 		cost: override.cost
 			? {
 					input: override.cost.input ?? model.cost.input,
@@ -155,7 +155,7 @@ function modelFromJson(
 		baseUrl,
 		reasoning: definition.reasoning ?? false,
 		thinkingLevelMap: definition.thinkingLevelMap,
-		input: (definition.input ?? ["text"]) as ("text" | "image")[],
+		input: (definition.input ?? ["text"]) as ("text" | "image" | "video" | "audio")[],
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: definition.contextWindow ?? 128000,
 		maxTokens: definition.maxTokens ?? 16384,

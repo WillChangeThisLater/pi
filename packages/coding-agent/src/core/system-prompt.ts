@@ -16,12 +16,24 @@ export interface BuildSystemPromptOptions {
 	promptGuidelines?: string[];
 	/** Text to append to system prompt. */
 	appendSystemPrompt?: string;
+	/** Active model identity and believed input media, injected into the prompt. */
+	model?: { provider: string; id: string; inputMedia: string[] };
 	/** Working directory. */
 	cwd: string;
 	/** Pre-loaded context files. */
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+}
+
+/**
+ * Format the model identity section: what the harness believes about the
+ * active model's name and input media. Framed as a belief, not a guarantee,
+ * since the model catalog can be wrong about a given deployment.
+ */
+function formatModelIdentity(model: NonNullable<BuildSystemPromptOptions["model"]>): string {
+	const media = model.inputMedia.length > 0 ? model.inputMedia.join(", ") : "text";
+	return `Model identity: you are ${model.provider}/${model.id}. Based on pi's model registry, we believe this model can accept the following input media: ${media}. This is our best guess, not a guarantee: if you have very strong evidence to the contrary (e.g., media reads repeatedly fail or the provider errors on media content), trust your own experience over this claim.`;
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -38,6 +50,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 	} = options;
 	const promptCwd = cwd.replace(/\\/g, "/");
 
+	const modelIdentity = options.model ? formatModelIdentity(options.model) : "";
+
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
 
 	const contextFiles = providedContextFiles ?? [];
@@ -48,6 +62,10 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 		if (appendSection) {
 			prompt += appendSection;
+		}
+
+		if (modelIdentity) {
+			prompt += `\n\n${modelIdentity}`;
 		}
 
 		// Append project context files
@@ -127,7 +145,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions): string {
 
 	let prompt = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
 
-Available tools:
+${modelIdentity ? modelIdentity + "\n\n" : ""}Available tools:
 ${toolsList}
 
 In addition to the tools above, you may have access to other custom tools depending on the project.

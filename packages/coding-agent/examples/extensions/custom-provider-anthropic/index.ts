@@ -27,6 +27,7 @@ import {
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
+	type AudioContent,
 	type Context,
 	calculateCost,
 	createAssistantMessageEventStream,
@@ -42,6 +43,7 @@ import {
 	type Tool,
 	type ToolCall,
 	type ToolResultMessage,
+	type VideoContent,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -187,7 +189,7 @@ function sanitizeSurrogates(text: string): string {
 }
 
 function convertContentBlocks(
-	content: (TextContent | ImageContent)[],
+	content: (TextContent | ImageContent | VideoContent | AudioContent)[],
 ): string | Array<{ type: "text"; text: string } | { type: "image"; source: any }> {
 	const hasImages = content.some((c) => c.type === "image");
 	if (!hasImages) {

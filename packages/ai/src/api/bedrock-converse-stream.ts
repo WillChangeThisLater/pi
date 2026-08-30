@@ -30,6 +30,7 @@ import { calculateCost } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
+	AudioContent,
 	CacheRetention,
 	Context,
 	ImageContent,
@@ -47,6 +48,7 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
+	VideoContent,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { normalizeProviderError } from "../utils/error-body.ts";
@@ -911,11 +913,23 @@ function sanitizeBedrockDocument(value: DocumentType): DocumentType {
 	return value;
 }
 
-function convertToolResultContent(content: (TextContent | ImageContent)[]): ToolResultContentBlock[] {
+function convertToolResultContent(
+	content: (TextContent | ImageContent | VideoContent | AudioContent)[],
+): ToolResultContentBlock[] {
 	const result: ToolResultContentBlock[] = [];
 	for (const c of content) {
 		if (c.type === "image") {
 			result.push({ image: createImageBlock(c.mimeType, c.data) });
+		} else if (c.type === "video") {
+			const textBlock = createNonBlankTextBlock(
+				`[video:${c.mimeType} omitted: tool result videos are not supported by this API]`,
+			);
+			if (textBlock) result.push(textBlock);
+		} else if (c.type === "audio") {
+			const textBlock = createNonBlankTextBlock(
+				`[audio:${c.mimeType} omitted: tool result audio is not supported by this API]`,
+			);
+			if (textBlock) result.push(textBlock);
 		} else {
 			const textBlock = createNonBlankTextBlock(c.text);
 			if (textBlock) result.push(textBlock);

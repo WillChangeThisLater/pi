@@ -3,7 +3,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model, Provider, ProviderHeaders } from "@earendil-works/pi-ai";
+import type { AudioContent, ImageContent, Model, Provider, ProviderHeaders, VideoContent } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
@@ -1130,7 +1130,7 @@ export class ExtensionRunner {
 
 	async emitBeforeAgentStart(
 		prompt: string,
-		images: ImageContent[] | undefined,
+		images: (ImageContent | VideoContent | AudioContent)[] | undefined,
 		systemPrompt: string,
 		systemPromptOptions: BuildSystemPromptOptions,
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
@@ -1245,7 +1245,7 @@ export class ExtensionRunner {
 	/** Emit input event. Transforms chain, "handled" short-circuits. */
 	async emitInput(
 		text: string,
-		images: ImageContent[] | undefined,
+		images: (ImageContent | VideoContent | AudioContent)[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
 	): Promise<InputEventResult> {

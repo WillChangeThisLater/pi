@@ -3,29 +3,40 @@
  */
 
 import { access, readFile, stat } from "node:fs/promises";
-import type { ImageContent } from "@earendil-works/pi-ai";
+import type { AudioContent, ImageContent, VideoContent } from "@earendil-works/pi-ai";
 import chalk from "chalk";
 import { resolve } from "path";
 import { resolveReadPath } from "../core/tools/path-utils.ts";
 import { processImage } from "../utils/image-process.ts";
-import { detectSupportedImageMimeTypeFromFile } from "../utils/mime.ts";
+import {
+	detectSupportedAudioMimeTypeFromFile,
+	detectSupportedImageMimeTypeFromFile,
+	detectSupportedVideoMimeTypeFromFile,
+} from "../utils/mime.ts";
 import { stripBom } from "../utils/text.ts";
 
 export interface ProcessedFiles {
 	text: string;
 	images: ImageContent[];
+	videos: VideoContent[];
+	audios: AudioContent[];
 }
 
 export interface ProcessFileOptions {
 	/** Whether to auto-resize images to 2000x2000 max. Default: true */
 	autoResizeImages?: boolean;
+	/** Whether to exit the process on missing/unreadable files. Default: true (CLI behavior). Set false for interactive use. */
+	exitOnError?: boolean;
 }
 
 /** Process @file arguments into text content and image attachments */
 export async function processFileArguments(fileArgs: string[], options?: ProcessFileOptions): Promise<ProcessedFiles> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
+	const exitOnError = options?.exitOnError ?? true;
 	let text = "";
 	const images: ImageContent[] = [];
+	const videos: VideoContent[] = [];
+	const audios: AudioContent[] = [];
 
 	for (const fileArg of fileArgs) {
 		// Expand and resolve path (handles ~ expansion and macOS screenshot Unicode spaces)
@@ -35,8 +46,12 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 		try {
 			await access(absolutePath);
 		} catch {
-			console.error(chalk.red(`Error: File not found: ${absolutePath}`));
-			process.exit(1);
+			if (exitOnError) {
+				console.error(chalk.red(`Error: File not found: ${absolutePath}`));
+				process.exit(1);
+			}
+			text += `<file name="${absolutePath}">error: file not found</file>\n`;
+			continue;
 		}
 
 		// Check if file is empty
@@ -47,6 +62,36 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 		}
 
 		const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
+
+		if (!mimeType) {
+			// Handle video file (before falling back to text)
+			const videoMimeType = await detectSupportedVideoMimeTypeFromFile(absolutePath);
+			if (videoMimeType) {
+				const content = await readFile(absolutePath);
+				const attachment: VideoContent = {
+					type: "video",
+					mimeType: videoMimeType,
+					data: content.toString("base64"),
+				};
+				videos.push(attachment);
+				text += `<file name="${absolutePath}"></file>\n`;
+				continue;
+			}
+
+			// Handle audio file (before falling back to text)
+			const audioMimeType = await detectSupportedAudioMimeTypeFromFile(absolutePath);
+			if (audioMimeType) {
+				const content = await readFile(absolutePath);
+				const attachment: AudioContent = {
+					type: "audio",
+					mimeType: audioMimeType,
+					data: content.toString("base64"),
+				};
+				audios.push(attachment);
+				text += `<file name="${absolutePath}"></file>\n`;
+				continue;
+			}
+		}
 
 		if (mimeType) {
 			// Handle image file
@@ -78,11 +123,14 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 				text += `<file name="${absolutePath}">\n${content}\n</file>\n`;
 			} catch (error: unknown) {
 				const message = error instanceof Error ? error.message : String(error);
-				console.error(chalk.red(`Error: Could not read file ${absolutePath}: ${message}`));
-				process.exit(1);
+				if (exitOnError) {
+					console.error(chalk.red(`Error: Could not read file ${absolutePath}: ${message}`));
+					process.exit(1);
+				}
+				text += `<file name="${absolutePath}">error: could not read file: ${message}</file>\n`;
 			}
 		}
 	}
 
-	return { text, images };
+	return { text, images, videos, audios };
 }

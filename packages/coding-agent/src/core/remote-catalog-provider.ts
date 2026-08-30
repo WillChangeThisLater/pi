@@ -11,8 +11,16 @@ function mergeModels(baseline: readonly Model<Api>[], dynamic: readonly Model<Ap
 	const merged = [...baseline];
 	for (const model of dynamic) {
 		const index = merged.findIndex((entry) => entry.id === model.id);
-		if (index >= 0) merged[index] = model;
-		else merged.push(model);
+		if (index >= 0) {
+			const existing = merged[index];
+			// The remote catalog may lag behind bundled data on input modalities (e.g. newly
+			// added video/audio support). Union the modality flags so a stale overlay can
+			// never downgrade what the bundled catalog declares.
+			const input = [...new Set([...existing.input, ...model.input])];
+			merged[index] = { ...model, input };
+		} else {
+			merged.push(model);
+		}
 	}
 	return merged;
 }

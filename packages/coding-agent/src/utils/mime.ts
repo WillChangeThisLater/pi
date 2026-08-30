@@ -33,6 +33,85 @@ export async function detectSupportedImageMimeTypeFromFile(filePath: string): Pr
 	}
 }
 
+export function detectSupportedVideoMimeType(buffer: Uint8Array): string | null {
+	// MP4 / MOV: ISO base media file format, brand string at offset 4 ("ftyp")
+	if (startsWithAscii(buffer, 4, "ftyp")) {
+		const brand = String.fromCharCode(buffer[8] ?? 0, buffer[9] ?? 0, buffer[10] ?? 0, buffer[11] ?? 0);
+		if (brand === "qt  ") return "video/quicktime";
+		return "video/mp4";
+	}
+	// WebM / Matroska: EBML header
+	if (startsWith(buffer, [0x1a, 0x45, 0xdf, 0xa3])) {
+		return "video/webm";
+	}
+	// MPEG program stream / elementary stream
+	if (startsWith(buffer, [0x00, 0x00, 0x01, 0xba]) || startsWith(buffer, [0x00, 0x00, 0x01, 0xb3])) {
+		return "video/mpeg";
+	}
+	return null;
+}
+
+export async function detectSupportedVideoMimeTypeFromFile(filePath: string): Promise<string | null> {
+	const fileHandle = await open(filePath, "r");
+	try {
+		const buffer = Buffer.alloc(IMAGE_TYPE_SNIFF_BYTES);
+		const { bytesRead } = await fileHandle.read(buffer, 0, IMAGE_TYPE_SNIFF_BYTES, 0);
+		return detectSupportedVideoMimeType(buffer.subarray(0, bytesRead));
+	} finally {
+		await fileHandle.close();
+	}
+}
+
+const AUDIO_TYPE_SNIFF_BYTES = 4100;
+
+export function detectSupportedAudioMimeType(buffer: Uint8Array): string | null {
+	// WAV: "RIFF"...."WAVE"
+	if (startsWithAscii(buffer, 0, "RIFF") && startsWithAscii(buffer, 8, "WAVE")) {
+		return "audio/wav";
+	}
+	// FLAC: "fLaC"
+	if (startsWithAscii(buffer, 0, "fLaC")) {
+		return "audio/flac";
+	}
+	// OGG: "OggS"
+	if (startsWithAscii(buffer, 0, "OggS")) {
+		return "audio/ogg";
+	}
+	// AIFF: "FORM"...."AIFF"
+	if (startsWithAscii(buffer, 0, "FORM") && startsWithAscii(buffer, 8, "AIFF")) {
+		return "audio/aiff";
+	}
+	// MP3: "ID3" tag or frame sync (0xFF Ex/Fx, excluding ADTS)
+	if (startsWithAscii(buffer, 0, "ID3")) {
+		return "audio/mpeg";
+	}
+	if (buffer.length >= 2 && (buffer[0] ?? 0) === 0xff && (buffer[1] ?? 0) === 0xf1) {
+		return "audio/aac"; // ADTS
+	}
+	if (buffer.length >= 2 && (buffer[0] ?? 0) === 0xff && ((buffer[1] ?? 0) & 0xe0) === 0xe0) {
+		return "audio/mpeg";
+	}
+	// M4A: ISO base media with M4A brand
+	if (startsWithAscii(buffer, 4, "ftyp")) {
+		const brand = String.fromCharCode(buffer[8] ?? 0, buffer[9] ?? 0, buffer[10] ?? 0, buffer[11] ?? 0);
+		if (brand.startsWith("M4A")) {
+			return "audio/mp4";
+		}
+	}
+	return null;
+}
+
+export async function detectSupportedAudioMimeTypeFromFile(filePath: string): Promise<string | null> {
+	const fileHandle = await open(filePath, "r");
+	try {
+		const buffer = Buffer.alloc(AUDIO_TYPE_SNIFF_BYTES);
+		const { bytesRead } = await fileHandle.read(buffer, 0, AUDIO_TYPE_SNIFF_BYTES, 0);
+		return detectSupportedAudioMimeType(buffer.subarray(0, bytesRead));
+	} finally {
+		await fileHandle.close();
+	}
+}
+
 function isPng(buffer: Uint8Array): boolean {
 	return (
 		buffer.length >= 16 && readUint32BE(buffer, PNG_SIGNATURE.length) === 13 && startsWithAscii(buffer, 12, "IHDR")
