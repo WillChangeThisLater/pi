@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { type ImageContent, type Message, type TextContent, type Usage, uuidv7 } from "@earendil-works/pi-ai";
+import type { ImageContent, Message, TextContent, Usage } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
@@ -19,6 +19,7 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { generateSessionId } from "../utils/session-names.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -206,7 +207,7 @@ export type ReadonlySessionManager = Pick<
 >;
 
 function createSessionId(): string {
-	return uuidv7();
+	return generateSessionId();
 }
 
 export function assertValidSessionId(id: string): void {
