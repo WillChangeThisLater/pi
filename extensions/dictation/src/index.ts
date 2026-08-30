@@ -23,9 +23,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { isKeyRelease, isKittyProtocolActive } from "@earendil-works/pi-tui";
 
 const SAMPLE_RATE = 16000;
-const ARECORD_ARGS = ["-D", "default", "-r", String(SAMPLE_RATE), "-c", "1", "-f", "S16_LE", "-t", "raw", "-"];
+const ARECORD_ARGS = ["-r", String(SAMPLE_RATE), "-c", "1", "-f", "S16_LE", "-t", "raw", "-"];
 const WIDGET_KEY = "dictation";
 
 function defaultBackend(): string {
@@ -83,7 +84,7 @@ function rms(pcm: Buffer): number {
 	return n === 0 ? 0 : Math.sqrt(sum / n);
 }
 
-const SILENCE_RMS = 250; // ~-42dBFS: room tone is ~30-80, speech is 1000+
+const SILENCE_RMS = Number(process.env.PI_DICTATION_SILENCE_RMS) || 250; // ~-42dBFS; room tone ~30-80, speech 1000+
 
 class DictationSession {
 	private backend: string;
@@ -162,7 +163,11 @@ class DictationSession {
 	}
 
 	private async begin(): Promise<void> {
-		this.ctx.ui.setWidget(WIDGET_KEY, ["● REC  dictating… (esc: cancel, toggle key: commit)"]);
+		const kitty = isKittyProtocolActive();
+		this.ctx.ui.setWidget(WIDGET_KEY, [
+			kitty ? "● REC  dictating… (release space to commit, ctrl+c cancels)" : "● REC  dictating… (toggle key: commit, ctrl+c cancels)",
+		]);
+		this.log("start", this.sourceFile ? `source=${this.sourceFile}` : `mic kitty=${kitty}`);
 
 		if (this.sourceFile) {
 			// Test hook: single pass over a static wav.
@@ -176,11 +181,23 @@ class DictationSession {
 			return;
 		}
 
-		this.arecord = spawn("arecord", ARECORD_ARGS, { stdio: ["ignore", "pipe", "ignore"] });
+		this.arecord = spawn("arecord", ["-D", process.env.PI_DICTATION_DEVICE ?? "default", ...ARECORD_ARGS.slice(1)], {
+			stdio: ["ignore", "pipe", "ignore"],
+		});
 		this.arecord.stdout?.on("data", (chunk: Buffer) => this.pcmChunks.push(chunk));
 		this.arecord.on("error", () => this.fail(new Error("arecord failed to start")));
 		this.arecord.on("close", () => (this.arecord = null));
 		this.timer = setInterval(() => void this.emitPartial(), this.partialMs);
+	}
+
+	private log(event: string, detail?: string): void {
+		const logPath = process.env.PI_DICTATION_LOG;
+		if (!logPath) return;
+		try {
+			fs.appendFileSync(logPath, `${JSON.stringify({ ts: Date.now(), event, detail })}\n`);
+		} catch {
+			// logging must never break dictation
+		}
 	}
 
 	private pcmSoFar(): Buffer {
@@ -218,6 +235,7 @@ class DictationSession {
 		if (rms(finalPcm) < SILENCE_RMS) {
 			// No speech detected (silence gate): cancel quietly instead of letting the
 			// backend hallucinate text from room tone.
+			this.log("silence-cancel", `rms=${Math.round(rms(finalPcm))} threshold=${SILENCE_RMS}`);
 			this.cancel();
 			return;
 		}
@@ -235,6 +253,7 @@ class DictationSession {
 
 	private commit(text: string): void {
 		this.stopCapture();
+		this.log("commit", text || "(silence)");
 		if (text) this.applyEditor(text);
 		this.teardown();
 	}
@@ -242,6 +261,7 @@ class DictationSession {
 	/** Cancel: restore the editor to its pre-dictation state. */
 	cancel(): void {
 		this.stopCapture();
+		this.log("cancel");
 		this.ctx.ui.setEditorText(this.savedEditorText);
 		this.teardown();
 	}
@@ -275,8 +295,60 @@ class DictationSession {
 
 export default function (pi: ExtensionAPI) {
 	let session: DictationSession | null = null;
+	let lastCtx: ExtensionContext | null = null;
+	let inputBound = false;
+	let holdStarting: Promise<DictationSession | null> | null = null;
+
+	// Hold-to-talk: with the Kitty keyboard protocol active, space press starts
+	// dictation and space release commits it (Claude Code convention). Space is
+	// therefore dedicated to dictation in those terminals.
+	function handleTerminalInput(data: string): { consume?: boolean } | undefined {
+		if (!isKittyProtocolActive()) return undefined;
+
+		// Space press (and key-repeat while held).
+		if (data === " ") {
+			if (session || holdStarting) return { consume: true }; // ignore repeats
+			const ctx = lastCtx;
+			if (!ctx) return undefined;
+			holdStarting = DictationSession.start(ctx)
+				.then((s) => {
+					session = s;
+					return s;
+				})
+				.catch(() => null);
+			return { consume: true };
+		}
+
+		// Space release (kitty CSI-u: codepoint 32 with event type :3).
+		if (isKeyRelease(data) && data.includes("\x1b[32;")) {
+			const starting = holdStarting;
+			holdStarting = null;
+			if (starting) {
+				void starting.then((s) => {
+					session = null;
+					void s?.commit();
+				});
+			} else if (session) {
+				const s = session;
+				session = null;
+				void s.commit();
+			}
+			return { consume: true };
+		}
+
+		return undefined;
+	}
+
+	pi.on("session_start", (event: unknown, ctx: ExtensionContext) => {
+		void event;
+		lastCtx = ctx;
+		if (inputBound || !ctx.ui.onTerminalInput) return;
+		inputBound = true;
+		ctx.ui.onTerminalInput(handleTerminalInput);
+	});
 
 	async function toggle(ctx: ExtensionContext): Promise<void> {
+		if (holdStarting) return; // hold in flight; let the release handle it
 		if (session) {
 			const s = session;
 			session = null;
@@ -284,10 +356,6 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		session = await DictationSession.start(ctx);
-	}
-
-	function isActive(): boolean {
-		return session !== null;
 	}
 
 	pi.registerShortcut("ctrl+space", {
