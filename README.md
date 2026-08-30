@@ -10,6 +10,23 @@
 
 > New issues and PRs from new contributors are auto-closed by default. Maintainers review auto-closed issues daily. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+# Fork: multimodal input, dictation, and agent-built features
+
+This is a fork of [badlogic/pi-mono](https://github.com/badlogic/pi-mono) that extends the pi coding agent with capabilities upstream does not have:
+
+- **Video and audio input support**: new video/audio content types flow through the whole stack — `pi-ai` (multimodal request encoding), `pi-protocol`/`pi-server` (transcript protocol), and `pi-coding-agent` (attachments, MIME handling, file processing). Attach video and audio files to prompts like images.
+- **TUI modality indicators**: the model selector and footer show which input modalities (text, image, video, audio) the currently selected model supports, so you always know what you can send.
+- **Model-aware system prompt**: pi injects the current model's identity and input capabilities into the system prompt, and notifies the model when you switch models mid-session — the agent knows what it is and what media it can accept.
+- **Dictation (push-to-talk STT)**: the [`extensions/dictation`](extensions/dictation) extension adds push-to-talk speech-to-text to the prompt editor. Hold a key, speak, and the transcript streams into your prompt live via a configurable backend command (`PI_DICTATION_BACKEND`, e.g. `whisper-cli`, `arecord`+STT, any external recognizer). Includes a streaming UI overlay, partial transcripts, and a test rig with fixture audio. See the [dictation README](extensions/dictation/README.md).
+- **Vi editing mode**: `set -o vi` style editing in the prompt editor ([`packages/tui`](packages/tui)).
+- **Fork tooling**: [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh) to pull upstream changes while rebasing in-progress feature branches.
+
+Every fork feature listed above was implemented end-to-end by AI agents (using pi itself) — no human-written code. The fork-specific rules they operated under are in [AGENTS.md](AGENTS.md).
+
+Keeping in sync with upstream: `git remote add upstream https://github.com/badlogic/pi-mono && ./scripts/sync-upstream.sh`.
+
+---
+
 # Pi Agent Harness
 
 This is the home of the Pi agent harness project including our self extensible coding agent.
