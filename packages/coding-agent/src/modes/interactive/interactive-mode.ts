@@ -2471,7 +2471,12 @@ export class InteractiveMode {
 			setTitle: (title) => this.ui.terminal.setTitle(title),
 			custom: (factory, options) => this.showExtensionCustom(factory, options),
 			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
-			setEditorText: (text) => this.editor.setText(text),
+			setEditorText: (text) => {
+				this.editor.setText(text);
+				// Programmatic updates from timers/extensions don't go through the input
+				// path, so nothing would repaint until the next keypress.
+				this.ui.requestRender();
+			},
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
 			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
 			addAutocompleteProvider: (factory) => {

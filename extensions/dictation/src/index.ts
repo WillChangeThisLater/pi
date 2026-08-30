@@ -1,0 +1,418 @@
+/**
+ * pi-dictation — push-to-talk dictation for the pi prompt editor.
+ *
+ * Architecture (v2):
+ *   - Audio source: arecord (live mic) or a WAV file (PI_DICTATION_SOURCE_FILE test hook).
+ *   - Recognizer: ANY external command via PI_DICTATION_BACKEND template, with {file}
+ *     substituted by a temp WAV path. Default: whisper-cli with ggml-base.en.
+ *   - Partials: while recording, the backend is re-run on the audio captured so far
+ *     every ~1.2s (skipping ticks while a run is in flight). Partials are streamed
+ *     directly into the prompt editor via ctx.ui.setEditorText() — no overlay.
+ *   - Escape cancels and restores the editor; the toggle key / Enter path commits.
+ *
+ * Env vars:
+ *   PI_DICTATION_BACKEND      command template, {file} = wav path
+ *                             (default: whisper-cli -m ~/.pi/agent/models/ggml-base.en.bin -nt)
+ *   PI_DICTATION_SOURCE_FILE  test hook: transcribe this wav instead of the mic
+ *   PI_DICTATION_PARTIAL_MS   partial interval in ms (default 1200)
+ *   PI_DICTATION_CASE         "sentence" (default) | "keep"
+ */
+
+import { spawn, type ChildProcess } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+	isKeyRelease,
+	isKeyRepeat,
+	isKittyProtocolActive,
+	matchesKey,
+} from "@earendil-works/pi-tui";
+
+const SAMPLE_RATE = 16000;
+const ARECORD_ARGS = ["-r", String(SAMPLE_RATE), "-c", "1", "-f", "S16_LE", "-t", "raw", "-"];
+const WIDGET_KEY = "dictation";
+
+function defaultBackend(): string {
+	const model = path.join(os.homedir(), ".pi/agent/models/ggml-base.en.bin");
+	const cli = ["whisper-cli", "whisper-cpp", "whisper"].find((b) => {
+		try {
+			require("node:child_process").execSync(`command -v ${b}`, { stdio: "ignore" });
+			return true;
+		} catch {
+			return false;
+		}
+	});
+	if (!cli) return "";
+	return `${cli} -m ${model} -nt {file}`;
+}
+
+function sentenceCase(text: string): string {
+	const t = text.trim().toLowerCase();
+	if (!t) return t;
+	return t[0]!.toUpperCase() + t.slice(1);
+}
+
+function normalizeTranscript(text: string): string {
+	if ((process.env.PI_DICTATION_CASE ?? "sentence") === "keep") return text.trim();
+	return sentenceCase(text);
+}
+
+/** Wrap raw s16le PCM bytes in a minimal WAV container (44-byte header). */
+function pcmToWav(pcm: Buffer): Buffer {
+	const header = Buffer.alloc(44);
+	header.write("RIFF", 0);
+	header.writeUInt32LE(36 + pcm.length, 4);
+	header.write("WAVE", 8);
+	header.write("fmt ", 12);
+	header.writeUInt32LE(16, 16); // PCM chunk size
+	header.writeUInt16LE(1, 20); // PCM format
+	header.writeUInt16LE(1, 22); // mono
+	header.writeUInt32LE(SAMPLE_RATE, 24);
+	header.writeUInt32LE(SAMPLE_RATE * 2, 28); // byte rate
+	header.writeUInt16LE(2, 32); // block align
+	header.writeUInt16LE(16, 34); // bits per sample
+	header.write("data", 36);
+	header.writeUInt32LE(pcm.length, 40);
+	return Buffer.concat([header, pcm]);
+}
+
+/** RMS amplitude of s16le PCM (0..32768). Guards against transcribing silence. */
+function rms(pcm: Buffer): number {
+	const n = Math.min(pcm.length >> 1, SAMPLE_RATE * 10);
+	let sum = 0;
+	for (let i = 0; i < n; i++) {
+		const v = pcm.readInt16LE(i * 2);
+		sum += v * v;
+	}
+	return n === 0 ? 0 : Math.sqrt(sum / n);
+}
+
+const SILENCE_RMS = Number(process.env.PI_DICTATION_SILENCE_RMS) || 250; // ~-42dBFS; room tone ~30-80, speech 1000+
+
+class DictationSession {
+	private backend: string;
+	private sourceFile: string | undefined;
+	private partialMs: number;
+
+	private arecord: ChildProcess | null = null;
+	private pcmChunks: Buffer[] = [];
+	private timer: ReturnType<typeof setInterval> | null = null;
+	private runInFlight = false;
+	private lastPartial = "";
+	private savedEditorText = "";
+	private tmpDir: string | null = null;
+
+	private constructor(
+		private ctx: ExtensionContext,
+		opts: { backend: string; sourceFile?: string; partialMs: number },
+	) {
+		this.backend = opts.backend;
+		this.sourceFile = opts.sourceFile;
+		this.partialMs = opts.partialMs;
+	}
+
+	static async start(ctx: ExtensionContext): Promise<DictationSession | null> {
+		const backend = process.env.PI_DICTATION_BACKEND || defaultBackend();
+		if (!backend) {
+			ctx.ui.notify(
+				"Dictation: no backend configured. Set PI_DICTATION_BACKEND (e.g. 'whisper-cli -m ~/.pi/agent/models/ggml-base.en.bin -nt')",
+				"error",
+			);
+			return null;
+		}
+		const partialMs = Number(process.env.PI_DICTATION_PARTIAL_MS) || 1200;
+		const session = new DictationSession(ctx, {
+			backend,
+			sourceFile: process.env.PI_DICTATION_SOURCE_FILE,
+			partialMs,
+		});
+		session.savedEditorText = ctx.ui.getEditorText();
+		await session.begin();
+		return session;
+	}
+
+	private tmpPath(ext: string): string {
+		if (!this.tmpDir) this.tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dictate-"));
+		return path.join(this.tmpDir, `audio.${ext}`);
+	}
+
+	/** Run the backend on a wav buffer; resolves with trimmed stdout text. */
+	private async transcribe(wav: Buffer): Promise<string> {
+		const wavPath = this.tmpPath("wav");
+		fs.writeFileSync(wavPath, wav);
+		const cmd = this.backend.includes("{file}")
+		? this.backend.replace(/\{file\}/g, wavPath)
+		: `${this.backend} ${wavPath}`;
+		return new Promise((resolve, reject) => {
+			const child = spawn(cmd, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+			let out = "";
+			let err = "";
+			const timeout = setTimeout(() => {
+				child.kill("SIGKILL");
+				reject(new Error("backend timeout (30s)"));
+			}, 30_000);
+			child.stdout?.on("data", (c: Buffer) => (out += c));
+			child.stderr?.on("data", (c: Buffer) => (err += c));
+			child.on("error", (e) => {
+				clearTimeout(timeout);
+				reject(e);
+			});
+			child.on("close", (code) => {
+				clearTimeout(timeout);
+				if (code !== 0) reject(new Error(`backend exit ${code}: ${err.slice(-300)}`));
+				else resolve(out.replace(/\s*\[[^\]]*\]\s*/g, " ").replace(/\s+/g, " ").trim());
+			});
+		});
+	}
+
+	private async begin(): Promise<void> {
+		const kitty = isKittyProtocolActive();
+		this.ctx.ui.setWidget(WIDGET_KEY, [
+			kitty ? "● REC  dictating… (release space to commit, ctrl+c cancels)" : "● REC  dictating… (toggle key: commit, ctrl+c cancels)",
+		]);
+		this.log("start", this.sourceFile ? `source=${this.sourceFile}` : `mic kitty=${kitty}`);
+
+		if (this.sourceFile) {
+			// Test hook: single pass over a static wav.
+			try {
+				const wav = fs.readFileSync(this.sourceFile);
+				const text = normalizeTranscript(await this.transcribe(wav));
+				this.finalize(text);
+			} catch (e) {
+				this.fail(e);
+			}
+			return;
+		}
+
+		this.arecord = spawn("arecord", ["-D", process.env.PI_DICTATION_DEVICE ?? "default", ...ARECORD_ARGS], {
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		this.arecord.stdout?.on("data", (chunk: Buffer) => this.pcmChunks.push(chunk));
+		this.arecord.on("error", () => this.fail(new Error("arecord failed to start")));
+		this.arecord.on("close", () => (this.arecord = null));
+		this.timer = setInterval(() => void this.emitPartial(), this.partialMs);
+	}
+
+	private log(event: string, detail?: string): void {
+		const logPath = process.env.PI_DICTATION_LOG;
+		if (!logPath) return;
+		try {
+			fs.appendFileSync(logPath, `${JSON.stringify({ ts: Date.now(), event, detail })}\n`);
+		} catch {
+			// logging must never break dictation
+		}
+	}
+
+	private pcmSoFar(): Buffer {
+		this.pcmChunks = [Buffer.concat(this.pcmChunks)];
+		return this.pcmChunks[0]!;
+	}
+
+	/** Re-run the backend on everything captured so far; stream result into the editor. */
+	private async emitPartial(): Promise<void> {
+		if (this.runInFlight || this.pcmSoFar().length < SAMPLE_RATE) return; // <1s: skip
+		if (rms(this.pcmSoFar()) < SILENCE_RMS) return; // silence: skip partial
+		this.runInFlight = true;
+		try {
+			const text = await this.transcribe(pcmToWav(this.pcmSoFar()));
+			this.log("partial", text || "(empty)");
+			if (text && text !== this.lastPartial) {
+				this.lastPartial = text;
+				this.applyEditor(text);
+			}
+		} catch {
+			// transient backend failures mid-stream are non-fatal; final run surfaces errors
+		} finally {
+			this.runInFlight = false;
+		}
+	}
+
+	private applyEditor(dictated: string): void {
+		const base = this.savedEditorText.trim();
+		this.ctx.ui.setEditorText(base ? `${base} ${dictated}` : dictated);
+	}
+
+	/** Stop capture, run the final transcription, write into the editor. */
+	async commit(): Promise<void> {
+		const finalPcm = this.pcmSoFar();
+		this.stopCapture();
+		if (rms(finalPcm) < SILENCE_RMS) {
+			// No speech detected (silence gate): cancel quietly instead of letting the
+			// backend hallucinate text from room tone.
+			this.log("silence-cancel", `rms=${Math.round(rms(finalPcm))} threshold=${SILENCE_RMS}`);
+			this.cancel();
+			return;
+		}
+		let text = this.lastPartial;
+		if (finalPcm.length > SAMPLE_RATE) {
+			try {
+				text = normalizeTranscript(await this.transcribe(pcmToWav(finalPcm)));
+			} catch (e) {
+				this.fail(e);
+				return;
+			}
+		}
+		this.finalize(text);
+	}
+
+	private finalize(text: string): void {
+		this.stopCapture();
+		this.log("commit", text || "(silence)");
+		if (text) this.applyEditor(text);
+		this.teardown();
+	}
+
+	/** Cancel: restore the editor to its pre-dictation state. */
+	cancel(): void {
+		this.stopCapture();
+		this.log("cancel");
+		this.ctx.ui.setEditorText(this.savedEditorText);
+		this.teardown();
+	}
+
+	private fail(e: unknown): void {
+		this.stopCapture();
+		this.ctx.ui.setEditorText(this.savedEditorText);
+		this.teardown();
+		this.ctx.ui.notify(`Dictation error: ${e instanceof Error ? e.message : String(e)}`, "error");
+	}
+
+	private stopCapture(): void {
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = null;
+		}
+		if (this.arecord) {
+			this.arecord.kill("SIGTERM");
+			this.arecord = null;
+		}
+	}
+
+	private teardown(): void {
+		this.ctx.ui.setWidget(WIDGET_KEY, undefined);
+		if (this.tmpDir) {
+			fs.rmSync(this.tmpDir, { recursive: true, force: true });
+			this.tmpDir = null;
+		}
+	}
+}
+
+export default function (pi: ExtensionAPI) {
+	let session: DictationSession | null = null;
+	let lastCtx: ExtensionContext | null = null;
+	let inputBound = false;
+	let holdStarting: Promise<DictationSession | null> | null = null;
+
+	/** Classify a space-bar event from raw terminal input, or null if not space. */
+	function spaceEvent(data: string): "press" | "repeat" | "release" | null {
+		if (data === " " || matchesKey(data, "space")) return "press";
+		// Kitty CSI-u repeats/releases carry codepoint 32, e.g. \x1b[32;1:2u / \x1b[32;1:3u.
+		if (isKeyRepeat(data) && data.includes("\x1b[32")) return "repeat";
+		if (isKeyRelease(data) && data.includes("\x1b[32")) return "release";
+		return null;
+	}
+
+	function startHold(ctx: ExtensionContext): void {
+		holdStarting = DictationSession.start(ctx)
+			.then((s) => {
+				session = s;
+				return s;
+			})
+			.catch(() => null);
+	}
+
+	function releaseHold(): void {
+		const starting = holdStarting;
+		holdStarting = null;
+		if (starting) {
+			void starting.then((s) => {
+				session = null;
+				void s?.commit();
+			});
+		} else if (session) {
+			const s = session;
+			session = null;
+			void s.commit();
+		}
+	}
+
+	// Hold-to-talk: with the Kitty keyboard protocol active, space press starts
+	// dictation and space release commits it (Claude Code convention). Space is
+	// dedicated to dictation only while a session is active.
+	//
+	// Without the Kitty protocol (e.g. pi inside tmux) terminals send no release
+	// events, so true hold-to-talk is impossible. Fallback: once a session is
+	// active (started via /dictate, ctrl+space, or alt+space), space presses are
+	// consumed and the first press commits (press-to-talk).
+	function handleTerminalInput(data: string): { consume?: boolean } | undefined {
+		const space = spaceEvent(data);
+		if (!space) return undefined;
+
+		if (isKittyProtocolActive()) {
+			switch (space) {
+				case "press":
+					if (session || holdStarting) return { consume: true }; // ignore repeats-as-press
+					if (!lastCtx) return undefined;
+					startHold(lastCtx);
+					return { consume: true };
+				case "repeat":
+					return session || holdStarting ? { consume: true } : undefined;
+				case "release":
+					if (!session && !holdStarting) return undefined;
+					releaseHold();
+					return { consume: true };
+			}
+		}
+
+		// Non-kitty fallback: press-to-talk commit while a session is active.
+		if (space === "press" && session) {
+			const s = session;
+			session = null;
+			void s.commit();
+			return { consume: true };
+		}
+
+		return undefined;
+	}
+
+	pi.on("session_start", (event: unknown, ctx: ExtensionContext) => {
+		void event;
+		lastCtx = ctx;
+		if (inputBound || !ctx.ui.onTerminalInput) return;
+		inputBound = true;
+		ctx.ui.onTerminalInput(handleTerminalInput);
+	});
+
+	async function toggle(ctx: ExtensionContext): Promise<void> {
+		if (holdStarting) return; // hold in flight; let the release handle it
+		if (session) {
+			const s = session;
+			session = null;
+			await s.commit();
+			return;
+		}
+		session = await DictationSession.start(ctx);
+	}
+
+	pi.registerShortcut("ctrl+space", {
+		description: "Toggle dictation (commit)",
+		handler: toggle,
+	});
+	pi.registerShortcut("alt+space", {
+		description: "Toggle dictation (fallback)",
+		handler: toggle,
+	});
+	// Note: cancel = ctrl+c (pi's built-in editor clear) or pressing the toggle key
+	// to commit. A dedicated escape binding conflicts with the built-in shortcut.
+	pi.registerCommand("dictate", {
+		description: "Toggle dictation",
+		handler: async (_args, ctx) => { await toggle(ctx); },
+	});
+
+	pi.on("session_shutdown", () => {
+		session?.cancel();
+		session = null;
+	});
+}
