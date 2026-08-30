@@ -1,7 +1,9 @@
 import {
+	type AudioContent as AiAudioContent,
 	type ImageContent as AiImageContent,
 	type TextContent as AiTextContent,
 	type Usage as AiUsage,
+	type VideoContent as AiVideoContent,
 	type Api,
 	type AssistantMessage,
 	getSupportedThinkingLevels,
@@ -43,6 +45,8 @@ type _AiThinkingContentFieldsAccountedFor = Assert<
 	>
 >;
 type _AiImageContentFieldsAccountedFor = Assert<ExactKeys<AiImageContent, "type" | "data" | "mimeType">>;
+type _AiVideoContentFieldsAccountedFor = Assert<ExactKeys<AiVideoContent, "type" | "data" | "mimeType">>;
+type _AiAudioContentFieldsAccountedFor = Assert<ExactKeys<AiAudioContent, "type" | "data" | "mimeType">>;
 type _AiToolCallFieldsAccountedFor = Assert<
 	ExactKeys<ToolCall, "type" | "id" | "name" | "arguments" | "thoughtSignature" | "namespace">
 >;
@@ -236,6 +240,10 @@ function toProtocolUserContent(content: UserMessage["content"]): UserTranscriptI
 				return { type: "text", text: part.text };
 			case "image":
 				return { type: "image", data: part.data, mimeType: part.mimeType };
+			case "video":
+				return { type: "video", data: part.data, mimeType: part.mimeType };
+			case "audio":
+				return { type: "audio", data: part.data, mimeType: part.mimeType };
 			default: {
 				const exhaustive: never = part;
 				return exhaustive;
@@ -336,13 +344,19 @@ export function toProtocolAssistantMessage(
 	}
 }
 
-function toProtocolToolContent(content: Array<AiTextContent | AiImageContent>): ToolTranscriptItem["content"] {
+function toProtocolToolContent(
+	content: Array<AiTextContent | AiImageContent | AiVideoContent | AiAudioContent>,
+): ToolTranscriptItem["content"] {
 	return content.map((part) => {
 		switch (part.type) {
 			case "text":
 				return { type: "text", text: part.text };
 			case "image":
 				return { type: "image", data: part.data, mimeType: part.mimeType };
+			case "video":
+				return { type: "video", data: part.data, mimeType: part.mimeType };
+			case "audio":
+				return { type: "audio", data: part.data, mimeType: part.mimeType };
 			default: {
 				const exhaustive: never = part;
 				return exhaustive;
