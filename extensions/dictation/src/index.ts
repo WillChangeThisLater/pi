@@ -1,44 +1,46 @@
 /**
- * pi-dictation — push-to-talk offline dictation for the pi prompt editor.
+ * pi-dictation — push-to-talk dictation for the pi prompt editor.
  *
- * Bindings:
- *   ctrl+space         toggle dictation (start / stop+transcribe)
- *   alt+space          same (fallback)
- *   /dictate           command form of the toggle
- *
- * Flow:
- *   1. Press shortcut → mic captures audio, streaming recognizer runs,
- *      partial text shown in a custom UI overlay
- *   2. Press shortcut again / Enter / Escape → stop, final partial
- *      inserted into the prompt editor
+ * Architecture (v2):
+ *   - Audio source: arecord (live mic) or a WAV file (PI_DICTATION_SOURCE_FILE test hook).
+ *   - Recognizer: ANY external command via PI_DICTATION_BACKEND template, with {file}
+ *     substituted by a temp WAV path. Default: whisper-cli with ggml-base.en.
+ *   - Partials: while recording, the backend is re-run on the audio captured so far
+ *     every ~1.2s (skipping ticks while a run is in flight). Partials are streamed
+ *     directly into the prompt editor via ctx.ui.setEditorText() — no overlay.
+ *   - Escape cancels and restores the editor; the toggle key / Enter path commits.
  *
  * Env vars:
- *   PI_DICTATION_MODEL_DIR  model directory (default ~/.pi/agent/models/...)
+ *   PI_DICTATION_BACKEND      command template, {file} = wav path
+ *                             (default: whisper-cli -m ~/.pi/agent/models/ggml-base.en.bin -nt)
  *   PI_DICTATION_SOURCE_FILE  test hook: transcribe this wav instead of the mic
- *   PI_DICTATION_CASE  "sentence" (default) or "keep"
- *
- * See scripts/download-model.sh to fetch the model.
+ *   PI_DICTATION_PARTIAL_MS   partial interval in ms (default 1200)
+ *   PI_DICTATION_CASE         "sentence" (default) | "keep"
  */
 
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
-import { homedir } from "node:os";
+import * as os from "node:os";
 import * as path from "node:path";
-import { createRequire } from "node:module";
-import type { Component, TUI } from "@earendil-works/pi-tui";
-import { matchesKey } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-const require = createRequire(import.meta.url);
-const sherpa = require("sherpa-onnx-node") as typeof import("sherpa-onnx-node");
-
 const SAMPLE_RATE = 16000;
-const FEED_CHUNK = 8000; // 0.5s per decode step
+const ARECORD_ARGS = ["-D", "default", "-r", String(SAMPLE_RATE), "-c", "1", "-f", "S16_LE", "-t", "raw", "-"];
+const WIDGET_KEY = "dictation";
 
-const DEFAULT_MODEL_DIR = path.join(
-	homedir(),
-	".pi/agent/models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17",
-);
+function defaultBackend(): string {
+	const model = path.join(os.homedir(), ".pi/agent/models/ggml-base.en.bin");
+	const cli = ["whisper-cli", "whisper-cpp", "whisper"].find((b) => {
+		try {
+			require("node:child_process").execSync(`command -v ${b}`, { stdio: "ignore" });
+			return true;
+		} catch {
+			return false;
+		}
+	});
+	if (!cli) return "";
+	return `${cli} -m ${model} -nt {file}`;
+}
 
 function sentenceCase(text: string): string {
 	const t = text.trim().toLowerCase();
@@ -51,271 +53,260 @@ function normalizeTranscript(text: string): string {
 	return sentenceCase(text);
 }
 
-/** Parse a 16k mono s16 WAV file into Float32Array samples. */
-function readWavSamples(wavPath: string): { samples: Float32Array; sampleRate: number } {
-	const buf = fs.readFileSync(wavPath);
-	if (buf.length < 44 || buf.toString("latin1", 0, 4) !== "RIFF") {
-		throw new Error(`Not a WAV file: ${wavPath}`);
-	}
-	let off = 12;
-	let dataOff = 0;
-	let dataLen = 0;
-	while (off + 8 <= buf.length) {
-		const id = buf.toString("latin1", off, off + 4);
-		const sz = buf.readUInt32LE(off + 4);
-		if (id === "data") {
-			dataOff = off + 8;
-			dataLen = sz;
-			break;
-		}
-		off += 8 + sz + (sz % 2);
-	}
-	if (dataLen === 0) throw new Error(`No data chunk in ${wavPath}`);
-	const nSamples = Math.floor(dataLen / 2);
-	const samples = new Float32Array(nSamples);
-	for (let i = 0; i < nSamples; i++) {
-		samples[i] = buf.readInt16LE(dataOff + i * 2) / 32768;
-	}
-	return { samples, sampleRate: SAMPLE_RATE };
+/** Wrap raw s16le PCM bytes in a minimal WAV container (44-byte header). */
+function pcmToWav(pcm: Buffer): Buffer {
+	const header = Buffer.alloc(44);
+	header.write("RIFF", 0);
+	header.writeUInt32LE(36 + pcm.length, 4);
+	header.write("WAVE", 8);
+	header.write("fmt ", 12);
+	header.writeUInt32LE(16, 16); // PCM chunk size
+	header.writeUInt16LE(1, 20); // PCM format
+	header.writeUInt16LE(1, 22); // mono
+	header.writeUInt32LE(SAMPLE_RATE, 24);
+	header.writeUInt32LE(SAMPLE_RATE * 2, 28); // byte rate
+	header.writeUInt16LE(2, 32); // block align
+	header.writeUInt16LE(16, 34); // bits per sample
+	header.write("data", 36);
+	header.writeUInt32LE(pcm.length, 40);
+	return Buffer.concat([header, pcm]);
 }
 
-/** Dictation UI: shows partial text, Enter/Escape to commit. */
-class DictationComponent implements Component {
-	focused = true;
-	private text = "…";
-	private tui: TUI;
-	private done: (result: string) => void;
+/** RMS amplitude of s16le PCM (0..32768). Guards against transcribing silence. */
+function rms(pcm: Buffer): number {
+	const n = Math.min(pcm.length >> 1, SAMPLE_RATE * 10);
+	let sum = 0;
+	for (let i = 0; i < n; i++) {
+		const v = pcm.readInt16LE(i * 2);
+		sum += v * v;
+	}
+	return n === 0 ? 0 : Math.sqrt(sum / n);
+}
 
-	constructor(tui: TUI, done: (result: string) => void) {
-		this.tui = tui;
-		this.done = done;
+const SILENCE_RMS = 250; // ~-42dBFS: room tone is ~30-80, speech is 1000+
+
+class DictationSession {
+	private backend: string;
+	private sourceFile: string | undefined;
+	private partialMs: number;
+
+	private arecord: ChildProcess | null = null;
+	private pcmChunks: Buffer[] = [];
+	private timer: ReturnType<typeof setInterval> | null = null;
+	private runInFlight = false;
+	private lastPartial = "";
+	private savedEditorText = "";
+	private tmpDir: string | null = null;
+
+	private constructor(
+		private ctx: ExtensionContext,
+		opts: { backend: string; sourceFile?: string; partialMs: number },
+	) {
+		this.backend = opts.backend;
+		this.sourceFile = opts.sourceFile;
+		this.partialMs = opts.partialMs;
 	}
 
-	update(text: string): void {
-		this.text = text;
-		this.tui.requestRender();
+	static async start(ctx: ExtensionContext): Promise<DictationSession | null> {
+		const backend = process.env.PI_DICTATION_BACKEND || defaultBackend();
+		if (!backend) {
+			ctx.ui.notify(
+				"Dictation: no backend configured. Set PI_DICTATION_BACKEND (e.g. 'whisper-cli -m ~/.pi/agent/models/ggml-base.en.bin -nt')",
+				"error",
+			);
+			return null;
+		}
+		const partialMs = Number(process.env.PI_DICTATION_PARTIAL_MS) || 1200;
+		const session = new DictationSession(ctx, {
+			backend,
+			sourceFile: process.env.PI_DICTATION_SOURCE_FILE,
+			partialMs,
+		});
+		session.savedEditorText = ctx.ui.getEditorText();
+		await session.begin();
+		return session;
 	}
 
-	invalidate(): void {}
-	dispose(): void {}
+	private tmpPath(ext: string): string {
+		if (!this.tmpDir) this.tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-dictate-"));
+		return path.join(this.tmpDir, `audio.${ext}`);
+	}
 
-	handleInput(data: string): void {
-		if (
-			matchesKey(data, "enter") ||
-			matchesKey(data, "escape") ||
-			matchesKey(data, "ctrl+space") ||
-			matchesKey(data, "alt+space") ||
-			matchesKey(data, "ctrl+c")
-		) {
-			this.done("__commit__");
+	/** Run the backend on a wav buffer; resolves with trimmed stdout text. */
+	private async transcribe(wav: Buffer): Promise<string> {
+		const wavPath = this.tmpPath("wav");
+		fs.writeFileSync(wavPath, wav);
+		const cmd = this.backend.includes("{file}")
+		? this.backend.replace(/\{file\}/g, wavPath)
+		: `${this.backend} ${wavPath}`;
+		return new Promise((resolve, reject) => {
+			const child = spawn(cmd, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
+			let out = "";
+			let err = "";
+			const timeout = setTimeout(() => {
+				child.kill("SIGKILL");
+				reject(new Error("backend timeout (30s)"));
+			}, 30_000);
+			child.stdout?.on("data", (c: Buffer) => (out += c));
+			child.stderr?.on("data", (c: Buffer) => (err += c));
+			child.on("error", (e) => {
+				clearTimeout(timeout);
+				reject(e);
+			});
+			child.on("close", (code) => {
+				clearTimeout(timeout);
+				if (code !== 0) reject(new Error(`backend exit ${code}: ${err.slice(-300)}`));
+				else resolve(out.replace(/\s*\[[^\]]*\]\s*/g, " ").replace(/\s+/g, " ").trim());
+			});
+		});
+	}
+
+	private async begin(): Promise<void> {
+		this.ctx.ui.setWidget(WIDGET_KEY, ["● REC  dictating… (esc: cancel, toggle key: commit)"]);
+
+		if (this.sourceFile) {
+			// Test hook: single pass over a static wav.
+			try {
+				const wav = fs.readFileSync(this.sourceFile);
+				const text = normalizeTranscript(await this.transcribe(wav));
+				this.commit(text);
+			} catch (e) {
+				this.fail(e);
+			}
+			return;
+		}
+
+		this.arecord = spawn("arecord", ARECORD_ARGS, { stdio: ["ignore", "pipe", "ignore"] });
+		this.arecord.stdout?.on("data", (chunk: Buffer) => this.pcmChunks.push(chunk));
+		this.arecord.on("error", () => this.fail(new Error("arecord failed to start")));
+		this.arecord.on("close", () => (this.arecord = null));
+		this.timer = setInterval(() => void this.emitPartial(), this.partialMs);
+	}
+
+	private pcmSoFar(): Buffer {
+		this.pcmChunks = [Buffer.concat(this.pcmChunks)];
+		return this.pcmChunks[0]!;
+	}
+
+	/** Re-run the backend on everything captured so far; stream result into the editor. */
+	private async emitPartial(): Promise<void> {
+		if (this.runInFlight || this.pcmSoFar().length < SAMPLE_RATE) return; // <1s: skip
+		if (rms(this.pcmSoFar()) < SILENCE_RMS) return; // silence: skip partial
+		this.runInFlight = true;
+		try {
+			const text = await this.transcribe(pcmToWav(this.pcmSoFar()));
+			if (text && text !== this.lastPartial) {
+				this.lastPartial = text;
+				this.applyEditor(text);
+			}
+		} catch {
+			// transient backend failures mid-stream are non-fatal; final run surfaces errors
+		} finally {
+			this.runInFlight = false;
 		}
 	}
 
-	render(width: number): string[] {
-		const w = Math.max(10, width);
-		const lines: string[] = [];
-		lines.push("● Dictation — Enter/Esc to stop".slice(0, w));
-		for (let i = 0; i < this.text.length; i += Math.max(1, w - 2)) {
-			lines.push(this.text.slice(i, i + Math.max(1, w - 2)));
+	private applyEditor(dictated: string): void {
+		const base = this.savedEditorText.trim();
+		this.ctx.ui.setEditorText(base ? `${base} ${dictated}` : dictated);
+	}
+
+	/** Stop capture, run the final transcription, write into the editor. */
+	async commit(): Promise<void> {
+		const finalPcm = this.pcmSoFar();
+		this.stopCapture();
+		if (rms(finalPcm) < SILENCE_RMS) {
+			// No speech detected (silence gate): cancel quietly instead of letting the
+			// backend hallucinate text from room tone.
+			this.cancel();
+			return;
 		}
-		return lines.slice(0, 40);
+		let text = this.lastPartial;
+		if (finalPcm.length > SAMPLE_RATE) {
+			try {
+				text = normalizeTranscript(await this.transcribe(pcmToWav(finalPcm)));
+			} catch (e) {
+				this.fail(e);
+				return;
+			}
+		}
+		this.commit(text);
+	}
+
+	private commit(text: string): void {
+		this.stopCapture();
+		if (text) this.applyEditor(text);
+		this.teardown();
+	}
+
+	/** Cancel: restore the editor to its pre-dictation state. */
+	cancel(): void {
+		this.stopCapture();
+		this.ctx.ui.setEditorText(this.savedEditorText);
+		this.teardown();
+	}
+
+	private fail(e: unknown): void {
+		this.stopCapture();
+		this.ctx.ui.setEditorText(this.savedEditorText);
+		this.teardown();
+		this.ctx.ui.notify(`Dictation error: ${e instanceof Error ? e.message : String(e)}`, "error");
+	}
+
+	private stopCapture(): void {
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = null;
+		}
+		if (this.arecord) {
+			this.arecord.kill("SIGTERM");
+			this.arecord = null;
+		}
+	}
+
+	private teardown(): void {
+		this.ctx.ui.setWidget(WIDGET_KEY, undefined);
+		if (this.tmpDir) {
+			fs.rmSync(this.tmpDir, { recursive: true, force: true });
+			this.tmpDir = null;
+		}
 	}
 }
 
 export default function (pi: ExtensionAPI) {
-	let recording = false;
-	let recognizer: any = null;
-	let stream: any = null;
-	let child: ReturnType<typeof spawn> | null = null;
-	let audioBuf = Buffer.alloc(0);
-	let pcmAccumulator = Buffer.alloc(0);
-	let drainTimer: ReturnType<typeof setInterval> | null = null;
-	let component: DictationComponent | null = null;
-	let lastPartial = "";
-
-	function cleanupCapture(): void {
-		if (drainTimer) {
-			clearInterval(drainTimer);
-			drainTimer = null;
-		}
-		if (child && !child.killed) {
-			child.kill("SIGTERM");
-		}
-		child = null;
-		audioBuf = Buffer.alloc(0);
-		pcmAccumulator = Buffer.alloc(0);
-		stream = null;
-	}
-
-	function drainAudio(): void {
-		if (!recognizer || !stream || !recording) return;
-
-		// Merge new audio, accumulate until we have ~1s to feed.
-		pcmAccumulator = Buffer.concat([pcmAccumulator, audioBuf]);
-		audioBuf = Buffer.alloc(0);
-
-		const bytesPerSample = 2;
-		const availBytes = Math.floor(pcmAccumulator.length / bytesPerSample) * bytesPerSample;
-		const availSamples = availBytes / bytesPerSample;
-		if (availSamples < 13000) return; // need ~0.8s for the feature extractor (39 frames × 320)
-
-		const floatChunk = new Float32Array(availSamples);
-		for (let i = 0; i < availSamples; i++) {
-			floatChunk[i] = pcmAccumulator.readInt16LE(i * bytesPerSample) / 32768;
-		}
-		pcmAccumulator = pcmAccumulator.subarray(availBytes);
-
-		// Feed in 0.5s chunks, decode each, update partial.
-		for (let fed = 0; fed < availSamples; fed += FEED_CHUNK) {
-			try {
-				stream.acceptWaveform({ sampleRate: SAMPLE_RATE, samples: floatChunk.subarray(fed, fed + FEED_CHUNK) });
-				recognizer.decode(stream);
-				const result = recognizer.getResult(stream);
-				const partial = (result?.text ?? "") as string;
-				if (partial && partial !== lastPartial) {
-					lastPartial = partial;
-					component?.update(lastPartial);
-				}
-			} catch {
-				// skip problematic chunks
-			}
-		}
-		component?.update(lastPartial || "…");
-	}
-
-	function startMicCapture(): void {
-		child = spawn("arecord", [
-			"-D", "default", "-r", "16000", "-c", "1", "-f", "S16_LE", "-t", "raw", "-",
-		], { stdio: ["ignore", "pipe", "ignore"] });
-		child.on("error", () => { recording = false; });
-		child.stdout?.on("data", (chunk: Buffer) => {
-			audioBuf = Buffer.concat([audioBuf, chunk]);
-		});
-	}
+	let session: DictationSession | null = null;
 
 	async function toggle(ctx: ExtensionContext): Promise<void> {
-		const modelDir = process.env.PI_DICTATION_MODEL_DIR ?? DEFAULT_MODEL_DIR;
-
-		// Test hook: transcribe wav directly.
-		if (process.env.PI_DICTATION_SOURCE_FILE && !recording) {
-			if (!recognizer) {
-				try {
-					recognizer = new sherpa.OnlineRecognizer({
-						featConfig: { sampleRate: SAMPLE_RATE, featureDim: 80 },
-						modelConfig: {
-							transducer: {
-								encoder: path.join(modelDir, "encoder-epoch-99-avg-1.int8.onnx"),
-								decoder: path.join(modelDir, "decoder-epoch-99-avg-1.int8.onnx"),
-								joiner: path.join(modelDir, "joiner-epoch-99-avg-1.int8.onnx"),
-							},
-							tokens: path.join(modelDir, "tokens.txt"),
-							numThreads: 4, debug: 0, provider: "cpu",
-						},
-						enableEndpoint: false,
-					});
-				} catch {
-					ctx.ui.notify("Dictation model load failed", "error");
-					return;
-				}
-			}
-			let samples: Float32Array;
-			try {
-				({ samples } = readWavSamples(process.env.PI_DICTATION_SOURCE_FILE));
-			} catch (err) {
-				ctx.ui.notify(`Test source error: ${err instanceof Error ? err.message : String(err)}`, "error");
-				return;
-			}
-			// Feed and get partials
-			let last = "";
-			const st = recognizer.createStream();
-			for (let fed = 0; fed < samples.length; fed += FEED_CHUNK) {
-				st.acceptWaveform({ sampleRate: SAMPLE_RATE, samples: samples.subarray(fed, fed + FEED_CHUNK) });
-				recognizer.decode(st);
-				const r = recognizer.getResult(st);
-				if (r.text) last = r.text;
-			}
-			const text = normalizeTranscript(last);
-			if (text) {
-				const base = ctx.ui.getEditorText();
-				ctx.ui.setEditorText(base ? `${base} ${text}` : text);
-			}
+		if (session) {
+			const s = session;
+			session = null;
+			await s.commit();
 			return;
 		}
-
-		if (recording) {
-			// Stop: close the custom UI, which will trigger the commit path.
-			recording = false;
-			cleanupCapture();
-			component?.handleInput("enter");
-			return;
-		}
-
-		// Ensure model is loaded.
-		if (!recognizer) {
-			for (const f of ["encoder-epoch-99-avg-1.int8.onnx", "decoder-epoch-99-avg-1.int8.onnx",
-				"joiner-epoch-99-avg-1.int8.onnx", "tokens.txt"]) {
-				if (!fs.existsSync(path.join(modelDir, f))) {
-					ctx.ui.notify("Dictation model missing. Run scripts/download-model.sh", "error");
-					return;
-				}
-			}
-			try {
-				recognizer = new sherpa.OnlineRecognizer({
-					featConfig: { sampleRate: SAMPLE_RATE, featureDim: 80 },
-					modelConfig: {
-						transducer: {
-							encoder: path.join(modelDir, "encoder-epoch-99-avg-1.int8.onnx"),
-							decoder: path.join(modelDir, "decoder-epoch-99-avg-1.int8.onnx"),
-							joiner: path.join(modelDir, "joiner-epoch-99-avg-1.int8.onnx"),
-						},
-						tokens: path.join(modelDir, "tokens.txt"),
-						numThreads: 4, debug: 0, provider: "cpu",
-					},
-					enableEndpoint: false,
-				});
-			} catch (err) {
-				ctx.ui.notify(`Dictation model load failed: ${err instanceof Error ? err.message : String(err)}`, "error");
-				return;
-			}
-		}
-
-		// Start recording and open custom UI.
-		recording = true;
-		lastPartial = "";
-		stream = recognizer.createStream();
-		audioBuf = Buffer.alloc(0);
-		pcmAccumulator = Buffer.alloc(0);
-		startMicCapture();
-		drainTimer = setInterval(drainAudio, 100);
-
-		const result = await ctx.ui.custom((tui, _theme, _kb, done) => {
-			component = new DictationComponent(tui, (r) => done(r));
-			return component;
-		});
-
-		recording = false;
-		cleanupCapture();
-
-		// Commit the final partial.
-		if (result === "__commit__") {
-			const text = normalizeTranscript(lastPartial);
-			if (text) {
-				const base = ctx.ui.getEditorText();
-				ctx.ui.setEditorText(base ? `${base} ${text}` : text);
-			}
-		}
+		session = await DictationSession.start(ctx);
 	}
 
-	pi.registerShortcut("ctrl+space", { description: "Toggle dictation", handler: toggle });
-	pi.registerShortcut("alt+space", { description: "Toggle dictation (fallback)", handler: toggle });
+	function isActive(): boolean {
+		return session !== null;
+	}
+
+	pi.registerShortcut("ctrl+space", {
+		description: "Toggle dictation (commit)",
+		handler: toggle,
+	});
+	pi.registerShortcut("alt+space", {
+		description: "Toggle dictation (fallback)",
+		handler: toggle,
+	});
+	// Note: cancel = ctrl+c (pi's built-in editor clear) or pressing the toggle key
+	// to commit. A dedicated escape binding conflicts with the built-in shortcut.
 	pi.registerCommand("dictate", {
 		description: "Toggle dictation",
 		handler: async (_args, ctx) => { await toggle(ctx); },
 	});
 
 	pi.on("session_shutdown", () => {
-		recording = false;
-		cleanupCapture();
-		component = null;
+		session?.cancel();
+		session = null;
 	});
 }

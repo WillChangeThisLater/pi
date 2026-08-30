@@ -1,0 +1,1 @@
+this is a longer dictation test. it has several sentences. some contain numbers like forty two. others contain technical terms like json and oauth. the goal is to test endpointing on natural pauses. good luck little recognizer.
