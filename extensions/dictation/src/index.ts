@@ -16,6 +16,18 @@
  *   PI_DICTATION_SOURCE_FILE  test hook: transcribe this wav instead of the mic
  *   PI_DICTATION_PARTIAL_MS   partial interval in ms (default 1200)
  *   PI_DICTATION_CASE         "sentence" (default) | "keep"
+ * Border color: while dictating, the prompt editor border turns red
+ *   (theme "error" color) via ctx.ui.setEditorBorderColor, if available.
+ *
+ * Stop words (hands-free submit):
+ *   If a partial transcript contains a stop phrase, dictation ends, the stop
+ *   phrase (and anything after it) is stripped, and the remaining text is sent
+ *   to pi as a user message. The space bar still commits to the editor without
+ *   submitting. Stop words come from (in order):
+ *     1. PI_DICTATION_STOP_WORDS env var (comma/space separated)
+ *     2. "dictation.stopWords" in ~/.pi/agent/settings.json (array or string)
+ *     3. built-in default: ["peacock"]
+ *   An empty list (env or settings) disables stop-word detection.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -91,10 +103,65 @@ function rms(pcm: Buffer): number {
 
 const SILENCE_RMS = Number(process.env.PI_DICTATION_SILENCE_RMS) || 250; // ~-42dBFS; room tone ~30-80, speech 1000+
 
+function escapeRegex(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Read stop words: env var → settings.json → built-in default ("peacock"). */
+function loadStopWords(): string[] {
+	const env = process.env.PI_DICTATION_STOP_WORDS;
+	if (env !== undefined) {
+		return env
+			.split(/[\s,]+/)
+			.map((s) => s.trim().toLowerCase())
+			.filter(Boolean);
+	}
+	try {
+		const settingsPath = path.join(os.homedir(), ".pi/agent/settings.json");
+		const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+			dictation?: { stopWords?: string[] | string };
+		};
+		const raw = settings.dictation?.stopWords;
+		if (Array.isArray(raw) || typeof raw === "string") {
+			return (Array.isArray(raw) ? raw : raw.split(/[\s,]+/))
+				.map((s) => s.trim().toLowerCase())
+				.filter(Boolean);
+		}
+	} catch {
+		// missing/unreadable settings.json: fall through to default
+	}
+	return ["peacock"];
+}
+
+/** Compile stop phrases into case-insensitive regexes (word-boundary anchored). */
+function compileStopPhrases(stopWords: string[]): RegExp[] {
+	return stopWords.map((phrase) => {
+		const words = phrase
+			.split(/\s+/)
+			.map(escapeRegex)
+			.join("[^a-zA-Z0-9]*");
+		return new RegExp(`(^|[^a-zA-Z0-9])${words}([^a-zA-Z0-9]|$)`, "i");
+	});
+}
+
+/** Split text at the first stop phrase. Returns the text before it, and whether one matched. */
+function splitStopPhrase(text: string, regexes: RegExp[]): { before: string; hit: boolean } {
+	for (const re of regexes) {
+		const m = re.exec(text);
+		if (m) return { before: text.slice(0, m.index).trim(), hit: true };
+	}
+	return { before: text, hit: false };
+}
+
 class DictationSession {
 	private backend: string;
 	private sourceFile: string | undefined;
 	private partialMs: number;
+	private stopWords: string[];
+	private stopPhraseRes: RegExp[];
+	private pi: ExtensionAPI;
+	private onEnded: () => void;
+	private autoSubmitTriggered = false;
 
 	private arecord: ChildProcess | null = null;
 	private pcmChunks: Buffer[] = [];
@@ -106,14 +173,25 @@ class DictationSession {
 
 	private constructor(
 		private ctx: ExtensionContext,
-		opts: { backend: string; sourceFile?: string; partialMs: number },
+		opts: {
+			backend: string;
+			sourceFile?: string;
+			partialMs: number;
+			stopWords: string[];
+			pi: ExtensionAPI;
+			onEnded: () => void;
+		},
 	) {
 		this.backend = opts.backend;
 		this.sourceFile = opts.sourceFile;
 		this.partialMs = opts.partialMs;
+		this.stopWords = opts.stopWords;
+		this.stopPhraseRes = compileStopPhrases(opts.stopWords);
+		this.pi = opts.pi;
+		this.onEnded = opts.onEnded;
 	}
 
-	static async start(ctx: ExtensionContext): Promise<DictationSession | null> {
+	static async start(ctx: ExtensionContext, pi: ExtensionAPI, onEnded: () => void): Promise<DictationSession | null> {
 		const backend = process.env.PI_DICTATION_BACKEND || defaultBackend();
 		if (!backend) {
 			ctx.ui.notify(
@@ -127,6 +205,9 @@ class DictationSession {
 			backend,
 			sourceFile: process.env.PI_DICTATION_SOURCE_FILE,
 			partialMs,
+			stopWords: loadStopWords(),
+			pi,
+			onEnded,
 		});
 		session.savedEditorText = ctx.ui.getEditorText();
 		await session.begin();
@@ -169,8 +250,12 @@ class DictationSession {
 
 	private async begin(): Promise<void> {
 		const kitty = isKittyProtocolActive();
+		const words = loadStopWords().join(", ") || "(none)";
+		this.setEditorBorderColor("error");
 		this.ctx.ui.setWidget(WIDGET_KEY, [
-			kitty ? "● REC  dictating… (release space to commit, ctrl+c cancels)" : "● REC  dictating… (toggle key: commit, ctrl+c cancels)",
+			kitty
+				? `● REC  dictating… (release space to commit, ctrl+c cancels, say "${words}" to send)`
+				: `● REC  dictating… (toggle key: commit, ctrl+c cancels, say "${words}" to send)`,
 		]);
 		this.log("start", this.sourceFile ? `source=${this.sourceFile}` : `mic kitty=${kitty}`);
 
@@ -220,6 +305,10 @@ class DictationSession {
 			this.log("partial", text || "(empty)");
 			if (text && text !== this.lastPartial) {
 				this.lastPartial = text;
+				if (this.stopPhraseRes.some((re) => re.test(text))) {
+					void this.autoSubmit();
+					return;
+				}
 				this.applyEditor(text);
 			}
 		} catch {
@@ -236,6 +325,7 @@ class DictationSession {
 
 	/** Stop capture, run the final transcription, write into the editor. */
 	async commit(): Promise<void> {
+		if (this.autoSubmitTriggered) return; // stop-word path owns this session now
 		const finalPcm = this.pcmSoFar();
 		this.stopCapture();
 		if (rms(finalPcm) < SILENCE_RMS) {
@@ -264,6 +354,46 @@ class DictationSession {
 		this.teardown();
 	}
 
+	/**
+	 * Stop word detected in a partial: stop capture, re-transcribe the full
+	 * buffer (best quality), strip the stop phrase and anything after it, and
+	 * send the remaining text to pi as a user message.
+	 */
+	private async autoSubmit(): Promise<void> {
+		if (this.autoSubmitTriggered) return;
+		this.autoSubmitTriggered = true;
+		this.stopCapture();
+		const finalPcm = this.pcmSoFar();
+		let text = this.lastPartial;
+		if (finalPcm.length > SAMPLE_RATE) {
+			try {
+				text = await this.transcribe(pcmToWav(finalPcm));
+			} catch {
+				// fall back to the last partial; the stop phrase is already in it
+			}
+		}
+		const { before, hit } = splitStopPhrase(text, this.stopPhraseRes);
+		this.log("stop-word-submit", before || "(empty)");
+		this.ctx.ui.setWidget(WIDGET_KEY, ["✓ stop word detected — sending…"]);
+		if (!hit || !before) {
+			// stop phrase with nothing (else) said: restore the editor quietly
+			this.ctx.ui.setEditorText(this.savedEditorText);
+			this.teardown();
+			this.onEnded();
+			return;
+		}
+		const message = normalizeTranscript(before);
+		this.ctx.ui.setEditorText(this.savedEditorText); // clear the partials from the editor
+		this.teardown();
+		this.onEnded();
+		try {
+			await this.pi.sendUserMessage(message);
+		} catch (e) {
+			this.ctx.ui.notify(`Dictation: submit failed: ${e instanceof Error ? e.message : String(e)}`, "error");
+			this.ctx.ui.setEditorText(message); // keep the text so nothing is lost
+		}
+	}
+
 	/** Cancel: restore the editor to its pre-dictation state. */
 	cancel(): void {
 		this.stopCapture();
@@ -290,8 +420,15 @@ class DictationSession {
 		}
 	}
 
+	private setEditorBorderColor(color: string | null): void {
+		// Older pi builds lack setEditorBorderColor; stay compatible.
+		if (typeof (this.ctx.ui as { setEditorBorderColor?: unknown }).setEditorBorderColor !== "function") return;
+		this.ctx.ui.setEditorBorderColor(color);
+	}
+
 	private teardown(): void {
 		this.ctx.ui.setWidget(WIDGET_KEY, undefined);
+		this.setEditorBorderColor(null);
 		if (this.tmpDir) {
 			fs.rmSync(this.tmpDir, { recursive: true, force: true });
 			this.tmpDir = null;
@@ -305,6 +442,11 @@ export default function (pi: ExtensionAPI) {
 	let inputBound = false;
 	let holdStarting: Promise<DictationSession | null> | null = null;
 
+	/** Clear the session ref when the session ends itself (stop-word auto-submit). */
+	function onSessionEnded(): void {
+		session = null;
+	}
+
 	/** Classify a space-bar event from raw terminal input, or null if not space. */
 	function spaceEvent(data: string): "press" | "repeat" | "release" | null {
 		if (data === " " || matchesKey(data, "space")) return "press";
@@ -315,7 +457,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function startHold(ctx: ExtensionContext): void {
-		holdStarting = DictationSession.start(ctx)
+		holdStarting = DictationSession.start(ctx, pi, onSessionEnded)
 			.then((s) => {
 				session = s;
 				return s;
@@ -393,7 +535,7 @@ export default function (pi: ExtensionAPI) {
 			await s.commit();
 			return;
 		}
-		session = await DictationSession.start(ctx);
+		session = await DictationSession.start(ctx, pi, onSessionEnded);
 	}
 
 	pi.registerShortcut("ctrl+space", {

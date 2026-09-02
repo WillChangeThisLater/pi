@@ -39,6 +39,37 @@ cancel; on commit the transcript is appended to whatever you already typed.
 If the recognizer hits an endpoint (silence) it finalizes that utterance and
 starts a new one, so you can pause mid-dictation.
 
+## Stop words (hands-free submit)
+
+While dictating, you can end and **submit** the prompt without touching the
+keyboard: just say the stop phrase. When a partial transcript contains it,
+dictation stops, the stop phrase (and anything said after it) is stripped, and
+the remaining text is sent to pi as a user message. Nothing said after the
+stop phrase is transcribed into the message.
+
+The space bar / toggle-key commit path is unchanged — it still writes into the
+editor so you can edit before sending yourself.
+
+Stop words come from (in order of precedence):
+
+1. `PI_DICTATION_STOP_WORDS` env var (comma/space separated)
+2. `dictation.stopWords` in `~/.pi/agent/settings.json`
+3. built-in default: `["peacock"]`
+
+An empty list (env var or settings) disables stop-word detection entirely.
+
+```json
+{
+  "dictation": {
+    "stopWords": ["peacock", "over and out"]
+  }
+}
+```
+
+Matching is case-insensitive with word boundaries ("peacocks" does not match
+"peacock"). Pick words you would never say in normal conversation — avoid
+code-adjacent words like "stop", "done", or "send".
+
 Case: the model emits uppercase; by default transcripts are normalized to
 sentence case. Set `PI_DICTATION_CASE=keep` to leave them as-is.
 
@@ -48,6 +79,7 @@ sentence case. Set `PI_DICTATION_CASE=keep` to leave them as-is.
 |---------|---------|---------|
 | `PI_DICTATION_MODEL_DIR` | `~/.pi/agent/models/sherpa-onnx-streaming-zipformer-en-20M-2023-02-17` | Model directory |
 | `PI_DICTATION_CASE` | `sentence` | `sentence` or `keep` |
+| `PI_DICTATION_STOP_WORDS` | from settings.json, default `peacock` | Comma/space-separated stop phrases for hands-free submit |
 | `PI_DICTATION_DEBUG` | off | Show key/commit debug notifies |
 
 ### Testing hooks (not for normal use)
