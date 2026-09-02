@@ -388,6 +388,11 @@ export class Theme {
 		}
 	}
 
+	/** Whether this theme defines the given foreground color name. */
+	hasColor(color: string): boolean {
+		return this.fgColors.has(color as ThemeColor);
+	}
+
 	fg(color: ThemeColor, text: string): string {
 		const ansi = this.fgColors.get(color);
 		if (!ansi) throw new Error(`Unknown theme color: ${color}`);

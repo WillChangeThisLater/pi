@@ -506,6 +506,8 @@ export class InteractiveMode {
 
 	// Track if editor is in bash mode (text starts with !)
 	private isBashMode = false;
+	/** Extension-set editor border color override (undefined = no override). */
+	private extensionEditorBorderColor: string | undefined;
 
 	// Track current bash execution component
 	private bashComponent: BashExecutionComponent | undefined = undefined;
@@ -2482,6 +2484,14 @@ export class InteractiveMode {
 				this.ui.requestRender();
 			},
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
+			setEditorBorderColor: (color) => {
+				if (color === null) {
+					this.extensionEditorBorderColor = undefined;
+				} else if (theme.hasColor(color)) {
+					this.extensionEditorBorderColor = color;
+				} // invalid color names are ignored
+				this.updateEditorBorderColor();
+			},
 			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
 			addAutocompleteProvider: (factory) => {
 				this.autocompleteProviderWrappers.push(factory);
@@ -4236,7 +4246,9 @@ export class InteractiveMode {
 	}
 
 	private updateEditorBorderColor(): void {
-		if (this.isBashMode) {
+		if (this.extensionEditorBorderColor !== undefined) {
+			this.editor.borderColor = (s: string) => theme.fg(this.extensionEditorBorderColor as ThemeColor, s);
+		} else if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
 		} else {
 			const level = this.session.thinkingLevel || "off";

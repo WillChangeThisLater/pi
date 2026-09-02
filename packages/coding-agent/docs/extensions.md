@@ -2629,6 +2629,11 @@ ctx.ui.setTitle("pi - my-project");
 ctx.ui.setEditorText("Prefill text");
 const current = ctx.ui.getEditorText();
 
+// Editor border color override (theme color name; null clears).
+// Takes priority over the built-in bash-mode/thinking-level colors until cleared.
+ctx.ui.setEditorBorderColor("error");   // e.g. red while recording
+ctx.ui.setEditorBorderColor(null);      // restore normal color
+
 // Paste into editor (triggers paste handling, including collapse for large content)
 ctx.ui.pasteToEditor("pasted content");
 

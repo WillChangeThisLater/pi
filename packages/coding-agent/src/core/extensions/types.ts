@@ -222,6 +222,14 @@ export interface ExtensionUIContext {
 	/** Get the current text from the core input editor. */
 	getEditorText(): string;
 
+	/**
+	 * Override the prompt editor's border color. `color` is a theme color name
+	 * (e.g. "error", "borderAccent", "warning"); `null` clears the override.
+	 * The override takes priority over the built-in bash-mode/thinking-level
+	 * colors until cleared. Invalid color names are ignored.
+	 */
+	setEditorBorderColor(color: string | null): void;
+
 	/** Show a multi-line editor for text editing. */
 	editor(title: string, prefill?: string): Promise<string | undefined>;
 

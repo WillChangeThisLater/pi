@@ -308,6 +308,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		setToolsExpanded(_expanded: boolean) {
 			// Tool expansion not supported in RPC mode - no TUI
 		},
+
+		setEditorBorderColor(_color: string | null) {
+			// No prompt editor border in RPC mode
+		},
 	});
 
 	runtimeHost.setRebindSession(async () => {
