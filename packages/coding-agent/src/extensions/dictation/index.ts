@@ -9,6 +9,9 @@
  *     every ~1.2s (skipping ticks while a run is in flight). Partials are streamed
  *     directly into the prompt editor via ctx.ui.setEditorText() — no overlay.
  *   - Escape cancels and restores the editor; the toggle key / Enter path commits.
+ *   - Speed stats: once the first partial completes, the REC widget shows an rt
+ *     factor (audio seconds / transcribe wall time) and text lag (time since the
+ *     previous partial landed). Widget-only; nothing persists after teardown.
  *
  * Setup (model, one-time): scripts/download-dictation-model.sh in the repo, or
  * place ggml-base.en at ~/.pi/agent/models/ggml-base.en.bin manually.
@@ -164,6 +167,9 @@ class DictationSession {
 	private lastPartial = "";
 	private savedEditorText = "";
 	private tmpDir: string | null = null;
+	private rtFactor = 0;
+	private textLagMs = 0;
+	private lastPartialDoneAt = 0;
 
 	private constructor(
 		ctx: ExtensionContext,
@@ -253,16 +259,24 @@ class DictationSession {
 		});
 	}
 
-	private async begin(): Promise<void> {
+	/** REC widget line; includes speed stats once a partial has completed. */
+	private setRecWidget(): void {
 		const kitty = isKittyProtocolActive();
 		const words = loadStopWords().join(", ") || "(none)";
+		const hint = kitty
+			? `release space to commit, ctrl+c cancels, say "${words}" to send`
+			: `toggle key: commit, ctrl+c cancels, say "${words}" to send`;
+		const stats =
+			this.rtFactor > 0
+				? `  ${this.rtFactor.toFixed(1)}x rt · text ~${(this.textLagMs / 1000).toFixed(1)}s behind`
+				: "";
+		this.ctx.ui.setWidget(WIDGET_KEY, [stats ? `● REC ${stats}  (${hint})` : `● REC  dictating… (${hint})`]);
+	}
+
+	private async begin(): Promise<void> {
 		this.setEditorBorderColor("error");
-		this.ctx.ui.setWidget(WIDGET_KEY, [
-			kitty
-				? `● REC  dictating… (release space to commit, ctrl+c cancels, say "${words}" to send)`
-				: `● REC  dictating… (toggle key: commit, ctrl+c cancels, say "${words}" to send)`,
-		]);
-		this.log("start", this.sourceFile ? `source=${this.sourceFile}` : `mic kitty=${kitty}`);
+		this.setRecWidget();
+		this.log("start", this.sourceFile ? `source=${this.sourceFile}` : `mic kitty=${isKittyProtocolActive()}`);
 
 		if (this.sourceFile) {
 			// Test hook: single pass over a static wav.
@@ -308,7 +322,16 @@ class DictationSession {
 		if (rms(this.pcmSoFar()) < SILENCE_RMS) return; // silence: skip partial
 		this.runInFlight = true;
 		try {
-			const text = await this.transcribe(pcmToWav(this.pcmSoFar()));
+			const pcm = this.pcmSoFar();
+			const startedAt = Date.now();
+			const text = await this.transcribe(pcmToWav(pcm));
+			const wallMs = Date.now() - startedAt;
+			// rt factor: audio seconds processed per wall-clock second of the last run.
+			this.rtFactor = pcm.length / (SAMPLE_RATE * 2) / (wallMs / 1000);
+			// text lag: how far the editor text was behind when this partial landed.
+			this.textLagMs = this.lastPartialDoneAt ? Date.now() - this.lastPartialDoneAt : 0;
+			this.lastPartialDoneAt = Date.now();
+			this.setRecWidget();
 			this.log("partial", text || "(empty)");
 			if (text && text !== this.lastPartial) {
 				this.lastPartial = text;
