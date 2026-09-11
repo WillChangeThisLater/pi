@@ -1,1 +1,0 @@
-edit the file src slash core slash system prompt dot ts and rebuild the bundle

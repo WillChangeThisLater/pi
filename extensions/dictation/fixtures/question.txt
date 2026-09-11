@@ -1,1 +1,0 @@
-what models support image input according to the model registry

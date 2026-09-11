@@ -1,1 +1,0 @@
-run npm run build in the coding agent package and show the last ten lines

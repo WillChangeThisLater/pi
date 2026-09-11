@@ -43,6 +43,7 @@ I regularly publish my own `pi-mono` work sessions here:
   - [Commands](#commands)
   - [Keyboard Shortcuts](#keyboard-shortcuts)
   - [Message Queue](#message-queue)
+  - [Dictation](#dictation)
 - [Sessions](#sessions)
   - [Branching](#branching)
   - [Compaction](#compaction)
@@ -231,6 +232,29 @@ Submit messages while the agent is working:
 On Windows Terminal, `Alt+Enter` is fullscreen by default. Remap it in [docs/terminal-setup.md](docs/terminal-setup.md) so pi can receive the follow-up shortcut.
 
 Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUpMode` can be `"one-at-a-time"` (default, waits for response) or `"all"` (delivers all queued at once). `transport` selects provider transport preference (`"sse"`, `"websocket"`, or `"auto"`) for providers that support multiple transports.
+
+### Dictation
+
+Built-in push-to-talk dictation: local speech-to-text streams into the prompt editor. No cloud, no API keys.
+
+Toggle with `/dictate`, `ctrl+space`, or `alt+space`. Say the stop word (default `peacock`) to end dictation and submit the transcript as a message; `ctrl+c` cancels.
+
+Setup — default backend is [whisper.cpp](https://github.com/ggml-org/whisper.cpp) + `ggml-base.en`:
+
+```bash
+# whisper.cpp is cmake-only. Prereqs: cmake, gcc, git, then:
+git clone https://github.com/ggml-org/whisper.cpp && cd whisper.cpp
+cmake -B build && cmake --build build -j --config Release
+sudo cp build/bin/whisper-cli /usr/local/bin/   # put whisper-cli on PATH
+
+# model (~148 MB):
+./packages/coding-agent/scripts/download-dictation-model.sh   # from the pi repo; lands at ~/.pi/agent/models/ggml-base.en.bin
+
+# Linux live mic: arecord (alsa-utils)
+sudo apt install alsa-utils
+```
+
+If no backend is found, `/dictate` explains what to install. Customize via `PI_DICTATION_BACKEND` (command template with `{file}`), `PI_DICTATION_DEVICE`, `PI_DICTATION_STOP_WORDS` or `dictation.stopWords` in `~/.pi/agent/settings.json`, `PI_DICTATION_CASE=sentence|keep`, `PI_DICTATION_PARTIAL_MS`. Running from a dev checkout (`pi-test.sh`/tsx) picks up source changes on restart; installed/bundled builds need a rebuild.
 
 ---
 
