@@ -235,18 +235,26 @@ Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUp
 
 ### Dictation
 
-Built-in push-to-talk dictation: speak, and the transcript streams into the prompt editor via local speech-to-text. No cloud, no API keys — audio never leaves the machine.
+Built-in push-to-talk dictation: local speech-to-text streams into the prompt editor. No cloud, no API keys.
 
-Toggle with `/dictate`, `ctrl+space`, or `alt+space`. With the Kitty keyboard protocol active, holding space dictates and releasing commits; otherwise, once dictation is active, pressing space commits. `ctrl+c` cancels and restores the prompt. While dictating, the prompt border turns red and a `● REC` widget shows the state.
+Toggle with `/dictate`, `ctrl+space`, or `alt+space`. Say the stop word (default `peacock`) to end dictation and submit the transcript as a message; `ctrl+c` cancels.
 
-Setup: the default backend uses [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-cli`, `whisper-cpp`, or `whisper` on `PATH`) with `ggml-base.en`:
+Setup — default backend is [whisper.cpp](https://github.com/ggml-org/whisper.cpp) + `ggml-base.en`:
 
 ```bash
-# install whisper.cpp (e.g. brew install whisper-cpp), then download the model (~148 MB):
-./scripts/download-dictation-model.sh   # from the pi repo; lands at ~/.pi/agent/models/ggml-base.en.bin
+# whisper.cpp is cmake-only. Prereqs: cmake, gcc, git, then:
+git clone https://github.com/ggml-org/whisper.cpp && cd whisper.cpp
+cmake -B build && cmake --build build -j --config Release
+sudo cp build/bin/whisper-cli /usr/local/bin/   # put whisper-cli on PATH
+
+# model (~148 MB):
+./packages/coding-agent/scripts/download-dictation-model.sh   # from the pi repo; lands at ~/.pi/agent/models/ggml-base.en.bin
+
+# Linux live mic: arecord (alsa-utils)
+sudo apt install alsa-utils
 ```
 
-If no backend is found, `/dictate` explains what to install. Stop words enable hands-free submit: say the stop phrase (default `peacock`) and the transcript — with the stop phrase stripped — is sent as a message. Configure via `PI_DICTATION_STOP_WORDS` or `dictation.stopWords` in `~/.pi/agent/settings.json` (empty list disables). Backend and other knobs: `PI_DICTATION_BACKEND` (command template with `{file}`), `PI_DICTATION_DEVICE`, `PI_DICTATION_CASE=sentence|keep`, `PI_DICTATION_PARTIAL_MS`.
+If no backend is found, `/dictate` explains what to install. Customize via `PI_DICTATION_BACKEND` (command template with `{file}`), `PI_DICTATION_DEVICE`, `PI_DICTATION_STOP_WORDS` or `dictation.stopWords` in `~/.pi/agent/settings.json`, `PI_DICTATION_CASE=sentence|keep`, `PI_DICTATION_PARTIAL_MS`. Running from a dev checkout (`pi-test.sh`/tsx) picks up source changes on restart; installed/bundled builds need a rebuild.
 
 ---
 
