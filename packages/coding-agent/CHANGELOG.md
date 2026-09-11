@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Built-in dictation extension (push-to-talk speech-to-text via whisper.cpp backend), replacing the standalone `extensions/dictation` extension; add `scripts/download-dictation-model.sh` for the default model
+
 ## [0.84.4] - 2026-08-28
 
 ### New Features

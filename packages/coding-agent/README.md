@@ -43,6 +43,7 @@ I regularly publish my own `pi-mono` work sessions here:
   - [Commands](#commands)
   - [Keyboard Shortcuts](#keyboard-shortcuts)
   - [Message Queue](#message-queue)
+  - [Dictation](#dictation)
 - [Sessions](#sessions)
   - [Branching](#branching)
   - [Compaction](#compaction)
@@ -231,6 +232,21 @@ Submit messages while the agent is working:
 On Windows Terminal, `Alt+Enter` is fullscreen by default. Remap it in [docs/terminal-setup.md](docs/terminal-setup.md) so pi can receive the follow-up shortcut.
 
 Configure delivery in [settings](docs/settings.md): `steeringMode` and `followUpMode` can be `"one-at-a-time"` (default, waits for response) or `"all"` (delivers all queued at once). `transport` selects provider transport preference (`"sse"`, `"websocket"`, or `"auto"`) for providers that support multiple transports.
+
+### Dictation
+
+Built-in push-to-talk dictation: speak, and the transcript streams into the prompt editor via local speech-to-text. No cloud, no API keys — audio never leaves the machine.
+
+Toggle with `/dictate`, `ctrl+space`, or `alt+space`. With the Kitty keyboard protocol active, holding space dictates and releasing commits; otherwise, once dictation is active, pressing space commits. `ctrl+c` cancels and restores the prompt. While dictating, the prompt border turns red and a `● REC` widget shows the state.
+
+Setup: the default backend uses [whisper.cpp](https://github.com/ggml-org/whisper.cpp) (`whisper-cli`, `whisper-cpp`, or `whisper` on `PATH`) with `ggml-base.en`:
+
+```bash
+# install whisper.cpp (e.g. brew install whisper-cpp), then download the model (~148 MB):
+./scripts/download-dictation-model.sh   # from the pi repo; lands at ~/.pi/agent/models/ggml-base.en.bin
+```
+
+If no backend is found, `/dictate` explains what to install. Stop words enable hands-free submit: say the stop phrase (default `peacock`) and the transcript — with the stop phrase stripped — is sent as a message. Configure via `PI_DICTATION_STOP_WORDS` or `dictation.stopWords` in `~/.pi/agent/settings.json` (empty list disables). Backend and other knobs: `PI_DICTATION_BACKEND` (command template with `{file}`), `PI_DICTATION_DEVICE`, `PI_DICTATION_CASE=sentence|keep`, `PI_DICTATION_PARTIAL_MS`.
 
 ---
 

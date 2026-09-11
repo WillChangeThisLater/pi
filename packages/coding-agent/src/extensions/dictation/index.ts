@@ -1,5 +1,5 @@
 /**
- * pi-dictation — push-to-talk dictation for the pi prompt editor.
+ * Dictation (built-in) — push-to-talk dictation for the pi prompt editor.
  *
  * Architecture (v2):
  *   - Audio source: arecord (live mic) or a WAV file (PI_DICTATION_SOURCE_FILE test hook).
@@ -9,6 +9,9 @@
  *     every ~1.2s (skipping ticks while a run is in flight). Partials are streamed
  *     directly into the prompt editor via ctx.ui.setEditorText() — no overlay.
  *   - Escape cancels and restores the editor; the toggle key / Enter path commits.
+ *
+ * Setup (model, one-time): scripts/download-dictation-model.sh in the repo, or
+ * place ggml-base.en at ~/.pi/agent/models/ggml-base.en.bin manually.
  *
  * Env vars:
  *   PI_DICTATION_BACKEND      command template, {file} = wav path
@@ -30,17 +33,12 @@
  *   An empty list (env or settings) disables stop-word detection.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-	isKeyRelease,
-	isKeyRepeat,
-	isKittyProtocolActive,
-	matchesKey,
-} from "@earendil-works/pi-tui";
+import { isKeyRelease, isKeyRepeat, isKittyProtocolActive, matchesKey } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionContext } from "../../core/extensions/types.ts";
 
 const SAMPLE_RATE = 16000;
 const ARECORD_ARGS = ["-r", String(SAMPLE_RATE), "-c", "1", "-f", "S16_LE", "-t", "raw", "-"];
@@ -50,7 +48,7 @@ function defaultBackend(): string {
 	const model = path.join(os.homedir(), ".pi/agent/models/ggml-base.en.bin");
 	const cli = ["whisper-cli", "whisper-cpp", "whisper"].find((b) => {
 		try {
-			require("node:child_process").execSync(`command -v ${b}`, { stdio: "ignore" });
+			execSync(`command -v ${b}`, { stdio: "ignore" });
 			return true;
 		} catch {
 			return false;
@@ -123,9 +121,7 @@ function loadStopWords(): string[] {
 		};
 		const raw = settings.dictation?.stopWords;
 		if (Array.isArray(raw) || typeof raw === "string") {
-			return (Array.isArray(raw) ? raw : raw.split(/[\s,]+/))
-				.map((s) => s.trim().toLowerCase())
-				.filter(Boolean);
+			return (Array.isArray(raw) ? raw : raw.split(/[\s,]+/)).map((s) => s.trim().toLowerCase()).filter(Boolean);
 		}
 	} catch {
 		// missing/unreadable settings.json: fall through to default
@@ -136,10 +132,7 @@ function loadStopWords(): string[] {
 /** Compile stop phrases into case-insensitive regexes (word-boundary anchored). */
 function compileStopPhrases(stopWords: string[]): RegExp[] {
 	return stopWords.map((phrase) => {
-		const words = phrase
-			.split(/\s+/)
-			.map(escapeRegex)
-			.join("[^a-zA-Z0-9]*");
+		const words = phrase.split(/\s+/).map(escapeRegex).join("[^a-zA-Z0-9]*");
 		return new RegExp(`(^|[^a-zA-Z0-9])${words}([^a-zA-Z0-9]|$)`, "i");
 	});
 }
@@ -154,6 +147,7 @@ function splitStopPhrase(text: string, regexes: RegExp[]): { before: string; hit
 }
 
 class DictationSession {
+	private ctx: ExtensionContext;
 	private backend: string;
 	private sourceFile: string | undefined;
 	private partialMs: number;
@@ -172,7 +166,7 @@ class DictationSession {
 	private tmpDir: string | null = null;
 
 	private constructor(
-		private ctx: ExtensionContext,
+		ctx: ExtensionContext,
 		opts: {
 			backend: string;
 			sourceFile?: string;
@@ -182,6 +176,7 @@ class DictationSession {
 			onEnded: () => void;
 		},
 	) {
+		this.ctx = ctx;
 		this.backend = opts.backend;
 		this.sourceFile = opts.sourceFile;
 		this.partialMs = opts.partialMs;
@@ -195,7 +190,7 @@ class DictationSession {
 		const backend = process.env.PI_DICTATION_BACKEND || defaultBackend();
 		if (!backend) {
 			ctx.ui.notify(
-				"Dictation: no backend configured. Set PI_DICTATION_BACKEND (e.g. 'whisper-cli -m ~/.pi/agent/models/ggml-base.en.bin -nt')",
+				"Dictation: no backend configured. Install whisper.cpp and the model (scripts/download-dictation-model.sh in the pi repo), or set PI_DICTATION_BACKEND (e.g. 'whisper-cli -m ~/.pi/agent/models/ggml-base.en.bin -nt')",
 				"error",
 			);
 			return null;
@@ -224,8 +219,8 @@ class DictationSession {
 		const wavPath = this.tmpPath("wav");
 		fs.writeFileSync(wavPath, wav);
 		const cmd = this.backend.includes("{file}")
-		? this.backend.replace(/\{file\}/g, wavPath)
-		: `${this.backend} ${wavPath}`;
+			? this.backend.replace(/\{file\}/g, wavPath)
+			: `${this.backend} ${wavPath}`;
 		return new Promise((resolve, reject) => {
 			const child = spawn(cmd, { shell: true, stdio: ["ignore", "pipe", "pipe"] });
 			let out = "";
@@ -234,8 +229,12 @@ class DictationSession {
 				child.kill("SIGKILL");
 				reject(new Error("backend timeout (30s)"));
 			}, 30_000);
-			child.stdout?.on("data", (c: Buffer) => (out += c));
-			child.stderr?.on("data", (c: Buffer) => (err += c));
+			child.stdout?.on("data", (c: Buffer) => {
+				out += c;
+			});
+			child.stderr?.on("data", (c: Buffer) => {
+				err += c;
+			});
 			child.on("error", (e) => {
 				clearTimeout(timeout);
 				reject(e);
@@ -243,7 +242,13 @@ class DictationSession {
 			child.on("close", (code) => {
 				clearTimeout(timeout);
 				if (code !== 0) reject(new Error(`backend exit ${code}: ${err.slice(-300)}`));
-				else resolve(out.replace(/\s*\[[^\]]*\]\s*/g, " ").replace(/\s+/g, " ").trim());
+				else
+					resolve(
+						out
+							.replace(/\s*\[[^\]]*\]\s*/g, " ")
+							.replace(/\s+/g, " ")
+							.trim(),
+					);
 			});
 		});
 	}
@@ -276,7 +281,9 @@ class DictationSession {
 		});
 		this.arecord.stdout?.on("data", (chunk: Buffer) => this.pcmChunks.push(chunk));
 		this.arecord.on("error", () => this.fail(new Error("arecord failed to start")));
-		this.arecord.on("close", () => (this.arecord = null));
+		this.arecord.on("close", () => {
+			this.arecord = null;
+		});
 		this.timer = setInterval(() => void this.emitPartial(), this.partialMs);
 	}
 
@@ -550,7 +557,9 @@ export default function (pi: ExtensionAPI) {
 	// to commit. A dedicated escape binding conflicts with the built-in shortcut.
 	pi.registerCommand("dictate", {
 		description: "Toggle dictation",
-		handler: async (_args, ctx) => { await toggle(ctx); },
+		handler: async (_args, ctx) => {
+			await toggle(ctx);
+		},
 	});
 
 	pi.on("session_shutdown", () => {
