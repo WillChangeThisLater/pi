@@ -479,10 +479,13 @@ export default function (pi: ExtensionAPI) {
 
 	/** Classify a space-bar event from raw terminal input, or null if not space. */
 	function spaceEvent(data: string): "press" | "repeat" | "release" | null {
-		if (data === " " || matchesKey(data, "space")) return "press";
 		// Kitty CSI-u repeats/releases carry codepoint 32, e.g. \x1b[32;1:2u / \x1b[32;1:3u.
+		// Check these BEFORE matchesKey: matchesKey("space") only compares codepoint and
+		// modifier, ignoring the kitty event type, so it would classify releases and
+		// repeats as presses and make the release/repeat branches unreachable.
 		if (isKeyRepeat(data) && data.includes("\x1b[32")) return "repeat";
 		if (isKeyRelease(data) && data.includes("\x1b[32")) return "release";
+		if (data === " " || matchesKey(data, "space")) return "press";
 		return null;
 	}
 
