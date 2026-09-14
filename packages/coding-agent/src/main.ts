@@ -59,6 +59,7 @@ import {
 import { assertValidSessionId, SessionManager } from "./core/session-manager.ts";
 import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/settings-diagnostics.ts";
 import { SettingsManager } from "./core/settings-manager.ts";
+import { loadStructuredOutputSchema } from "./core/structured-output.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { builtInExtensions } from "./extensions/index.ts";
@@ -644,6 +645,20 @@ export async function main(args: string[], options?: MainOptions) {
 	validateForkFlags(parsed);
 	validateSessionIdFlags(parsed);
 
+	let structuredOutputSchema: Record<string, unknown> | undefined;
+	if (parsed.schema) {
+		if (appMode !== "print") {
+			console.error(chalk.red("Error: --schema is only supported in print mode (-p)"));
+			process.exit(1);
+		}
+		try {
+			structuredOutputSchema = loadStructuredOutputSchema(parsed.schema);
+		} catch (error) {
+			console.error(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
+			process.exit(1);
+		}
+	}
+
 	// Run migrations (pass cwd for project-local migrations)
 	const { migratedAuthProviders: migratedProviders, deprecationWarnings } = runMigrations(cwd);
 	time("runMigrations");
@@ -967,6 +982,7 @@ export async function main(args: string[], options?: MainOptions) {
 			messages: parsed.messages,
 			initialMessage,
 			initialImages,
+			structuredOutputSchema,
 		});
 		stopThemeWatcher();
 		restoreStdout();

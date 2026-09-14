@@ -1,0 +1,1 @@
+{ "type": "object", "properties": { "ref": { "$ref": "#/definitions/x" } }, "required": ["ref"] }

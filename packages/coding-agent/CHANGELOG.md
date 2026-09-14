@@ -2,8 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Dictation hold-to-talk: check kitty key repeat/release before the space press match so space releases (e.g. `\x1b[32;1:3u`) are no longer misclassified as presses, which previously consumed every space event and made commit-on-release unreachable in kitty-protocol terminals
+
 ### Added
 
+- Structured output in print mode: `pi -p --schema <file.json|->` runs the agent normally, then forces a schema-conformant final result via a constrained `report` tool call over the transcript, validates it against the schema (one retry), and prints only the JSON to stdout
 - Built-in dictation extension (push-to-talk speech-to-text via whisper.cpp backend), replacing the standalone `extensions/dictation` extension; add `scripts/download-dictation-model.sh` for the default model
 
 ## [0.84.4] - 2026-08-28

@@ -164,6 +164,14 @@ describe("constrained tool sampling", () => {
 			{
 				parameters: {
 					type: "object",
+					properties: { x: { type: ["string", "number"] } },
+					required: ["x"],
+				} as Tool["parameters"],
+				error: "type arrays may contain at most one non-null type",
+			},
+			{
+				parameters: {
+					type: "object",
 					properties: { child: { $ref: "https://example.com/child.json" } },
 					required: ["child"],
 				} as Tool["parameters"],

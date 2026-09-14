@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Tool-argument validation no longer fabricates values: `null` against required number/integer/boolean/string schemas now fails validation instead of coercing to `0`/`false`/`""`, and boolean-to-number coercion (`true` -> `1`) is removed
+- String-to-number coercion is restricted to strict decimal literals; non-decimal strings like `"0x1F"` are no longer silently rewritten (`Number()` reinterpretation)
+
+### Fixed
+
+- Strict tool-schema conversion now rejects JSON-Schema `type` arrays with more than one non-null member (e.g. `["string", "number"]`), matching OpenAI strict-mode constraints; `T` and `[T, "null"]` remain supported
+
 ## [0.84.4] - 2026-08-28
 
 ### Added

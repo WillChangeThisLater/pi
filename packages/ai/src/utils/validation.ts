@@ -56,42 +56,39 @@ function getSubSchemaValidator(schema: JsonSchemaObject): ReturnType<typeof Comp
 	}
 }
 
+// Strict decimal literal: optional sign, digits with optional fraction, optional exponent.
+// Deliberately narrower than Number(): hex/octal ("0x1F"), Infinity, and other numeric
+// forms are rejected so tool-call arguments are never silently rewritten into a
+// different value.
+const STRICT_DECIMAL_PATTERN = /^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/;
+
+function coerceStringToNumber(value: string): unknown {
+	const trimmed = value.trim();
+	if (trimmed !== "" && STRICT_DECIMAL_PATTERN.test(trimmed)) {
+		const parsed = Number(trimmed);
+		if (Number.isFinite(parsed)) {
+			return parsed;
+		}
+	}
+	return value;
+}
+
 function coercePrimitiveByType(value: unknown, type: string): unknown {
 	switch (type) {
 		case "number": {
-			if (value === null) {
-				return 0;
-			}
-			if (typeof value === "string" && value.trim() !== "") {
-				const parsed = Number(value);
-				if (Number.isFinite(parsed)) {
-					return parsed;
-				}
-			}
-			if (typeof value === "boolean") {
-				return value ? 1 : 0;
+			if (typeof value === "string") {
+				return coerceStringToNumber(value);
 			}
 			return value;
 		}
 		case "integer": {
-			if (value === null) {
-				return 0;
-			}
-			if (typeof value === "string" && value.trim() !== "") {
-				const parsed = Number(value);
-				if (Number.isInteger(parsed)) {
-					return parsed;
-				}
-			}
-			if (typeof value === "boolean") {
-				return value ? 1 : 0;
+			if (typeof value === "string") {
+				const coerced = coerceStringToNumber(value);
+				return typeof coerced === "number" && Number.isInteger(coerced) ? coerced : value;
 			}
 			return value;
 		}
 		case "boolean": {
-			if (value === null) {
-				return false;
-			}
 			if (typeof value === "string") {
 				if (value === "true") {
 					return true;
@@ -111,9 +108,6 @@ function coercePrimitiveByType(value: unknown, type: string): unknown {
 			return value;
 		}
 		case "string": {
-			if (value === null) {
-				return "";
-			}
 			if (typeof value === "number" || typeof value === "boolean") {
 				return String(value);
 			}

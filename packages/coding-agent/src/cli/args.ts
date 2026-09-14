@@ -36,6 +36,7 @@ export interface Args {
 	extensions?: string[];
 	noExtensions?: boolean;
 	print?: boolean;
+	schema?: string;
 	export?: string;
 	noSkills?: boolean;
 	skills?: string[];
@@ -161,6 +162,8 @@ export function parseArgs(args: string[]): Args {
 				result.messages.push(next);
 				i++;
 			}
+		} else if (arg === "--schema" && i + 1 < args.length) {
+			result.schema = args[++i];
 		} else if (arg === "--export" && i + 1 < args.length) {
 			result.export = args[++i];
 		} else if ((arg === "--extension" || arg === "-e") && i + 1 < args.length) {
@@ -282,6 +285,8 @@ ${chalk.bold("Options:")}
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
+  --schema <file>                JSON Schema file (or "-" for stdin); with -p, forces the
+                                 final output to conform and prints it as JSON. Print mode only.
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID
@@ -343,6 +348,9 @@ ${chalk.bold("Examples:")}
 
   # Prompt beginning with a dash
   ${APP_NAME} -p -- "- Summarize these points"
+
+  # Structured output: run an agent, force the final result to match a JSON Schema
+  ${APP_NAME} -p --schema result.schema.json "Count the TypeScript files in src/"
 
   # Multiple messages (interactive)
   ${APP_NAME} "Read package.json" "What dependencies do we have?"

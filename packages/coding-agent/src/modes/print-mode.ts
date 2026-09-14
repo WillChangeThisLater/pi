@@ -9,6 +9,7 @@
 import type { AssistantMessage, AudioContent, ImageContent, VideoContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
+import { extractStructuredOutput } from "../core/structured-output.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
 
@@ -24,6 +25,8 @@ export interface PrintModeOptions {
 	initialMessage?: string;
 	/** Images to attach to the initial message */
 	initialImages?: (ImageContent | VideoContent | AudioContent)[];
+	/** JSON Schema for forced structured output; when set, stdout receives only the schema-conformant JSON result */
+	structuredOutputSchema?: Record<string, unknown>;
 }
 
 /**
@@ -31,7 +34,7 @@ export interface PrintModeOptions {
  * Sends prompts to the agent and outputs the result.
  */
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
-	const { mode, messages = [], initialMessage, initialImages } = options;
+	const { mode, messages = [], initialMessage, initialImages, structuredOutputSchema } = options;
 	let exitCode = 0;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
@@ -134,6 +137,13 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		for (const message of messages) {
 			await session.prompt(message);
+		}
+
+		if (structuredOutputSchema) {
+			const result = await extractStructuredOutput(session, structuredOutputSchema);
+			const json = process.stdout.isTTY ? JSON.stringify(result, null, 2) : JSON.stringify(result);
+			writeRawStdout(`${json}\n`);
+			return exitCode;
 		}
 
 		if (mode === "text") {

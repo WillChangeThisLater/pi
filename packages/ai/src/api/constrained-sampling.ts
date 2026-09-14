@@ -60,6 +60,10 @@ function makeJsonSchemaNodeStrict(schema: unknown): void {
 		}
 	}
 
+	if (Array.isArray(schema.type) && schema.type.filter((t) => t !== "null").length > 1) {
+		throw new UnsupportedStrictJsonSchemaError("type arrays may contain at most one non-null type");
+	}
+
 	if (schema.anyOf !== undefined) {
 		if (!Array.isArray(schema.anyOf) || schema.anyOf.length === 0) {
 			throw new UnsupportedStrictJsonSchemaError("anyOf must contain at least one schema");
