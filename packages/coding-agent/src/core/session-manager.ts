@@ -9,7 +9,6 @@ import {
 	type ToolResultMessage,
 	type Usage,
 	type UserMessage,
-	uuidv7,
 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
@@ -31,6 +30,7 @@ import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { generateSessionId } from "../utils/session-names.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -262,7 +262,7 @@ export type ReadonlySessionManager = Pick<
 >;
 
 function createSessionId(): string {
-	return uuidv7();
+	return generateSessionId();
 }
 
 export function assertValidSessionId(id: string): void {

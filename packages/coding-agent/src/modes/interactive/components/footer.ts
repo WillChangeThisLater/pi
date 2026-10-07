@@ -170,6 +170,12 @@ export class FooterComponent implements Component {
 			pwd = `${pwd} (${branch})`;
 		}
 
+		// Add session id if available (full id — it's a readable name like "springer-katahdin-4217")
+		const sessionId = this.session.sessionManager.getSessionId();
+		if (sessionId) {
+			pwd = `${pwd} #${sessionId}`;
+		}
+
 		// Add session name if set
 		const sessionName = this.session.sessionManager.getSessionName();
 		if (sessionName) {
