@@ -18,15 +18,17 @@ import type {
 	Api,
 	AssistantMessage,
 	AudioContent,
-	Context,
 	ImageContent,
 	Model,
 	StopReason,
+	StreamOptions,
+	SystemMessage,
 	TextContent,
 	TextSignatureV1,
 	ThinkingContent,
 	Tool,
 	ToolCall,
+	TranscriptContext,
 	Usage,
 	VideoContent,
 } from "../types.ts";
@@ -34,6 +36,8 @@ import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
+import { resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import {
 	appendGrammarToolInputJsonDelta,
 	type GrammarToolInputJsonBuffer,
@@ -80,22 +84,20 @@ function convertToolResultOutput<TApi extends Api>(
 	model: Model<TApi>,
 	content: readonly (TextContent | ImageContent | VideoContent | AudioContent)[],
 ): string | ToolResultOutputContent {
+	// Video/audio blocks are not encodable for this API; convert to text notes.
+	const mediaNotes = content
+		.filter((c): c is VideoContent | AudioContent => c.type === "video" || c.type === "audio")
+		.map((m) => ({ type: "text" as const, text: `[${m.type}: ${m.mimeType}]` }));
+	const textAndImages = content.filter(
+		(c): c is TextContent | ImageContent => c.type === "text" || c.type === "image",
+	) as readonly (TextContent | ImageContent)[];
+	content = [...textAndImages, ...mediaNotes];
 	const textResult = content
 		.filter((c): c is TextContent => c.type === "text")
 		.map((c) => c.text)
 		.join("\n");
 	const images = content.filter((c): c is ImageContent => c.type === "image");
-	const videos = content.filter((c): c is VideoContent => c.type === "video");
-	const audios = content.filter((c): c is AudioContent => c.type === "audio");
 	const hasText = textResult.length > 0;
-
-	if (videos.length > 0 && !hasText && images.length === 0) {
-		return sanitizeSurrogates("(see attached video)");
-	}
-
-	if (audios.length > 0 && !hasText && images.length === 0 && videos.length === 0) {
-		return sanitizeSurrogates("(see attached audio)");
-	}
 
 	if (images.length === 0 || !model.input.includes("image")) {
 		return sanitizeSurrogates(hasText ? textResult : images.length > 0 ? "(see attached image)" : "(no tool output)");
@@ -116,6 +118,7 @@ function convertToolResultOutput<TApi extends Api>(
 }
 
 export interface OpenAIResponsesStreamOptions {
+	onProviderStreamEvent?: StreamOptions["onProviderStreamEvent"];
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	grammarToolInputProperties?: ReadonlyMap<string, string>;
 	resolveServiceTier?: (
@@ -131,8 +134,10 @@ export interface OpenAIResponsesStreamOptions {
 export interface ConvertResponsesMessagesOptions {
 	includeSystemPrompt?: boolean;
 	grammarToolInputProperties?: ReadonlyMap<string, string>;
-	deferredTools?: ReadonlyMap<string, Tool>;
-	deferredToolsMode?: "additional-tools" | "tool-search";
+	/** Whether later system messages are sent in place; otherwise they are folded into the leading prompt. */
+	supportsMidConvoSystemMessages?: boolean;
+	supportsAdditionalTools?: boolean;
+	supportsToolSearch?: boolean;
 	toolOptions?: ConvertResponsesToolsOptions;
 }
 
@@ -140,7 +145,7 @@ export interface ConvertResponsesToolsOptions {
 	strict?: boolean | null;
 	supportsStrictMode?: boolean;
 	supportsOpenAIGrammarTools?: boolean;
-	deferLoading?: boolean;
+	toolSearchResult?: boolean;
 }
 
 // =============================================================================
@@ -149,12 +154,12 @@ export interface ConvertResponsesToolsOptions {
 
 export function convertResponsesMessages<TApi extends Api>(
 	model: Model<TApi>,
-	context: Context,
+	context: TranscriptContext,
 	allowedToolCallProviders: ReadonlySet<string>,
 	options?: ConvertResponsesMessagesOptions,
 ): ResponseInput {
+	const normalizedContext = resolveTranscript(context, options?.supportsMidConvoSystemMessages);
 	const messages: ResponseInput = [];
-	const loadedToolNames = new Set<string>();
 
 	const normalizeIdPart = (part: string): string => {
 		const sanitized = part.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -181,21 +186,57 @@ export function convertResponsesMessages<TApi extends Api>(
 		return `${normalizedCallId}|${normalizedItemId}`;
 	};
 
-	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
-
-	const includeSystemPrompt = options?.includeSystemPrompt ?? true;
-	if (includeSystemPrompt && context.systemPrompt) {
-		const compat = model.compat as { supportsDeveloperRole?: boolean } | undefined;
-		const role = model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
+	const transformedMessages = transformMessages(normalizedContext.messages, model, normalizeToolCallId);
+	const transcriptTools = resolveTranscriptTools(
+		normalizedContext.messages,
+		(options?.supportsAdditionalTools ?? false) || (options?.supportsToolSearch ?? false),
+	);
+	const appendSystemToolAdditions = (message: SystemMessage, seed: string): void => {
+		const tools = transcriptTools.anchorsAdditions ? (message.toolsAdded ?? []) : [];
+		if (tools.length === 0) return;
+		if (options?.supportsAdditionalTools) {
+			messages.push({
+				type: "additional_tools",
+				role: "developer",
+				tools: convertResponsesTools(tools, options.toolOptions),
+			} satisfies ResponseInputItem);
+			return;
+		}
+		if (!options?.supportsToolSearch) return;
+		const names = tools.map((tool) => tool.name);
+		const callId = `pi_tool_load_${shortHash(`${seed}:${names.join(",")}`)}`;
 		messages.push({
-			role,
-			content: sanitizeSurrogates(context.systemPrompt),
-		});
-	}
+			type: "tool_search_call",
+			call_id: callId,
+			execution: "client",
+			status: "completed",
+			arguments: { query: names.join(" "), limit: names.length },
+		} satisfies ResponseInputItem);
+		messages.push({
+			type: "tool_search_output",
+			call_id: callId,
+			execution: "client",
+			status: "completed",
+			tools: convertResponsesTools(tools, { ...options.toolOptions, toolSearchResult: true }),
+		} satisfies ResponseToolSearchOutputItemParam);
+	};
+	const includeInitialSystemMessage = options?.includeSystemPrompt ?? true;
+	const compat = model.compat as { supportsDeveloperRole?: boolean } | undefined;
+	const instructionRole = model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
 
 	let msgIndex = 0;
+	let sourceIndex = 0;
 	for (const msg of transformedMessages) {
-		if (msg.role === "user") {
+		const isLeadingSystemMessage = sourceIndex++ === 0 && msg.role === "system";
+		if (msg.role === "system") {
+			if (!isLeadingSystemMessage) appendSystemToolAdditions(msg, `system:${msgIndex}`);
+			if (!isLeadingSystemMessage || includeInitialSystemMessage) {
+				const text = isLeadingSystemMessage ? getSystemMessageText(msg) : renderSystemMessageUpdate(msg);
+				if (text.length > 0) {
+					messages.push({ role: instructionRole, content: sanitizeSurrogates(text) });
+				}
+			}
+		} else if (msg.role === "user") {
 			if (typeof msg.content === "string") {
 				messages.push({
 					role: "user",
@@ -263,18 +304,15 @@ export function convertResponsesMessages<TApi extends Api>(
 					let itemId: string | undefined = itemIdRaw;
 
 					// For different-model messages, set id to undefined to avoid pairing validation.
-					// OpenAI tracks which fc_xxx IDs were paired with rs_xxx reasoning items.
+					// OpenAI tracks which item IDs were paired with rs_xxx reasoning items.
 					// By omitting the id, we avoid triggering that validation (like cross-provider does).
-					// When replaying custom-tool calls as a function_call, also drop non-fc_* ids such as
-					// ctc_* custom-tool ids because function_call item ids must be fc_*.
-					if (
-						(isDifferentModel && itemId?.startsWith("fc_")) ||
-						(customInputProperty === undefined && !itemId?.startsWith("fc_"))
-					) {
+					// Also drop ids that do not match the replayed item type: function_call ids must be fc_*
+					// and custom_tool_call ids must be ctc_*. Foreign tool call ids are normalized to fc_*, and
+					// a call can switch between the two types when grammar tool support differs.
+					const itemIdPrefix = customInputProperty === undefined ? "fc_" : "ctc_";
+					if (isDifferentModel || !itemId?.startsWith(itemIdPrefix)) {
 						itemId = undefined;
 					}
-
-					const canReplayNamespace = isSameModel || options?.deferredTools?.has(toolCall.name) === true;
 
 					if (customInputProperty !== undefined) {
 						output.push({
@@ -285,9 +323,7 @@ export function convertResponsesMessages<TApi extends Api>(
 							input: sanitizeSurrogates(
 								getGrammarToolInput(toolCall.name, toolCall.arguments, customInputProperty),
 							),
-							...(canReplayNamespace && toolCall.namespace !== undefined
-								? { namespace: toolCall.namespace }
-								: {}),
+							...(isSameModel && toolCall.namespace !== undefined ? { namespace: toolCall.namespace } : {}),
 						} satisfies ResponseOutputItem);
 					} else {
 						output.push({
@@ -296,9 +332,7 @@ export function convertResponsesMessages<TApi extends Api>(
 							call_id: callId,
 							name: toolCall.name,
 							arguments: JSON.stringify(toolCall.arguments),
-							...(canReplayNamespace && toolCall.namespace !== undefined
-								? { namespace: toolCall.namespace }
-								: {}),
+							...(isSameModel && toolCall.namespace !== undefined ? { namespace: toolCall.namespace } : {}),
 						});
 					}
 				}
@@ -322,43 +356,8 @@ export function convertResponsesMessages<TApi extends Api>(
 					output,
 				});
 			}
-
-			const deferredTools: Tool[] = [];
-			for (const name of msg.addedToolNames ?? []) {
-				const tool = options?.deferredTools?.get(name);
-				if (!tool || loadedToolNames.has(name)) continue;
-				loadedToolNames.add(name);
-				deferredTools.push(tool);
-			}
-			if (deferredTools.length > 0 && options?.deferredToolsMode === "additional-tools") {
-				messages.push({
-					type: "additional_tools",
-					role: "developer",
-					tools: convertResponsesTools(deferredTools, options.toolOptions),
-				} satisfies ResponseInputItem);
-			} else if (deferredTools.length > 0 && options?.deferredToolsMode === "tool-search") {
-				const names = deferredTools.map((tool) => tool.name);
-				const searchCallId = `pi_tool_load_${shortHash(`${msg.toolCallId}:${names.join(",")}`)}`;
-				messages.push({
-					type: "tool_search_call",
-					call_id: searchCallId,
-					execution: "client",
-					status: "completed",
-					arguments: { query: names.join(" "), limit: names.length },
-				} satisfies ResponseInputItem);
-				messages.push({
-					type: "tool_search_output",
-					call_id: searchCallId,
-					execution: "client",
-					status: "completed",
-					tools: convertResponsesTools(deferredTools, {
-						...options.toolOptions,
-						deferLoading: true,
-					}),
-				} satisfies ResponseToolSearchOutputItemParam);
-			}
 		}
-		msgIndex++;
+		if (!isLeadingSystemMessage) msgIndex++;
 	}
 
 	return messages;
@@ -385,7 +384,7 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 					syntax: grammar.format,
 					definition: grammar.definition,
 				},
-				...(options?.deferLoading ? { defer_loading: true } : {}),
+				...(options?.toolSearchResult ? { defer_loading: true } : {}),
 			} satisfies OpenAITool;
 		}
 
@@ -398,7 +397,7 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 			name: tool.name,
 			description: tool.description,
 			parameters: getJsonSchemaToolParameters(tool, strict === true) as Record<string, unknown>,
-			...(options?.deferLoading ? { defer_loading: true } : {}),
+			...(options?.toolSearchResult ? { defer_loading: true } : {}),
 		};
 		if (supportsStrictMode) {
 			functionTool.strict = strict;
@@ -600,13 +599,15 @@ export async function processResponsesStream<TApi extends Api>(
 		output.rawStopReason = incompleteReason ? `${status}.${incompleteReason}` : status;
 		const mappedStop = mapStopReason(status, incompleteReason);
 		output.stopReason = mappedStop.stopReason;
-		output.errorMessage = mappedStop.errorMessage;
+		if (mappedStop.errorMessage === undefined) delete output.errorMessage;
+		else output.errorMessage = mappedStop.errorMessage;
 		if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 			output.stopReason = "toolUse";
 		}
 	};
 
 	for await (const event of openaiStream) {
+		await options?.onProviderStreamEvent?.(event, model);
 		if (event.type === "response.created") {
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {
@@ -768,6 +769,20 @@ export async function processResponsesStream<TApi extends Api>(
 	}
 	if (!sawTerminalResponseEvent) {
 		throw new Error("OpenAI Responses stream ended before a terminal response event");
+	}
+	// The agent runs every tool call in the final message. Refuse to hand over calls whose
+	// output_item.done never arrived: their arguments may be cut off or mixed up, e.g. when a
+	// non-compliant server omits output_index. Finished calls have their scratch buffers removed.
+	if (output.stopReason === "toolUse") {
+		for (const block of output.content) {
+			if (block.type !== "toolCall") continue;
+			const toolCall = block as StreamingToolCall;
+			if (toolCall.partialJson !== undefined || toolCall.customInput !== undefined) {
+				throw new Error(
+					`OpenAI Responses stream completed with an unfinished tool call: ${toolCall.name} (${toolCall.id})`,
+				);
+			}
+		}
 	}
 }
 

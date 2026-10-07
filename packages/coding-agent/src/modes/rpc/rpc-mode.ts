@@ -235,6 +235,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			this.setEditorText(text);
 		},
 
+		setEditorBorderColor(_color: string | null): void {
+			// No live editor border in RPC mode
+		},
+
 		setEditorText(text: string): void {
 			// Fire and forget - host can implement editor control
 			output({
@@ -307,10 +311,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 		setToolsExpanded(_expanded: boolean) {
 			// Tool expansion not supported in RPC mode - no TUI
-		},
-
-		setEditorBorderColor(_color: string | null) {
-			// No prompt editor border in RPC mode
 		},
 	});
 
@@ -404,11 +404,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
-						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								preflightSucceeded = true;
-								output(success(id, "prompt"));
-							}
+						preflightResult: (disposition) => {
+							preflightSucceeded = true;
+							output(success(id, "prompt", { disposition }));
 						},
 					})
 					.catch((e) => {
@@ -420,13 +418,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images);
-				return success(id, "steer");
+				const disposition = await session.steer(command.message, command.images, { source: "rpc" });
+				return success(id, "steer", { disposition });
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images);
-				return success(id, "follow_up");
+				const disposition = await session.followUp(command.message, command.images, { source: "rpc" });
+				return success(id, "follow_up", { disposition });
 			}
 
 			case "abort": {

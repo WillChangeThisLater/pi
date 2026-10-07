@@ -32,8 +32,9 @@ import type {
 	AssistantMessage,
 	AudioContent,
 	CacheRetention,
-	Context,
 	ImageContent,
+	JsonObject,
+	JsonValue,
 	Model,
 	ProviderEnv,
 	ProviderResponse,
@@ -58,6 +59,14 @@ import { parseStreamingJson } from "../utils/json-parse.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { getSystemMessageText } from "../utils/text.ts";
+import {
+	collapseSystemMessages,
+	getCurrentTools,
+	getInitialSystemMessage,
+	type TranscriptContext,
+	withoutInitialSystemMessage,
+} from "../utils/transcript.ts";
 import { getJsonSchemaToolParameters, resolveJsonSchemaStrictSampling } from "./constrained-sampling.ts";
 import {
 	adjustMaxTokensForThinking,
@@ -112,15 +121,19 @@ type Block = (TextContent | ThinkingContent | ToolCall) & {
 
 const EMPTY_TEXT_PLACEHOLDER = "<empty>";
 
+const THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01";
+
 /** Matches the placeholder the Anthropic API path uses for redacted thinking. */
 const REDACTED_THINKING_PLACEHOLDER = "[Reasoning redacted]";
 
 export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> = (
 	model: Model<"bedrock-converse-stream">,
-	context: Context,
+	context: TranscriptContext,
 	options: BedrockOptions = {},
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
+	// Bedrock has no mid-conversation system messages; fold them into the leading prompt.
+	const normalizedContext = collapseSystemMessages(context);
 
 	(async () => {
 		const output: AssistantMessage = {
@@ -250,15 +263,21 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			}
 			const cacheRetention = resolveCacheRetention(options.cacheRetention, options.env);
 			const inferenceMaxTokens = options.maxTokens ?? (isAnthropicClaudeModel(model) ? model.maxTokens : undefined);
+			const initialSystemMessage = getInitialSystemMessage(normalizedContext.messages);
+			const initialSystemPrompt = initialSystemMessage ? getSystemMessageText(initialSystemMessage) : undefined;
 			let commandInput = {
 				modelId: model.id,
-				messages: convertMessages(context, model, cacheRetention, options.env),
-				system: buildSystemPrompt(context.systemPrompt, model, cacheRetention, options.env),
+				messages: convertMessages(normalizedContext, model, cacheRetention, options.env),
+				system: buildSystemPrompt(initialSystemPrompt, model, cacheRetention, options.env),
 				inferenceConfig: {
 					...(inferenceMaxTokens !== undefined && { maxTokens: inferenceMaxTokens }),
 					...(options.temperature !== undefined && { temperature: options.temperature }),
 				},
-				toolConfig: convertToolConfig(context.tools, options.toolChoice, supportsStrictMode),
+				toolConfig: convertToolConfig(
+					getCurrentTools(normalizedContext.messages),
+					options.toolChoice,
+					supportsStrictMode,
+				),
 				additionalModelRequestFields: buildAdditionalModelRequestFields(model, options),
 				...(options.requestMetadata !== undefined && { requestMetadata: options.requestMetadata }),
 			};
@@ -279,6 +298,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			}
 
 			for await (const item of response.stream!) {
+				await options.onProviderStreamEvent?.(item, model);
 				if (item.messageStart) {
 					if (item.messageStart.role !== ConversationRole.ASSISTANT) {
 						throw new Error("Unexpected assistant message start but got user message start instead");
@@ -424,7 +444,7 @@ function appendBedrockFailureDiagnostic(
 	fallbackRequestId: string | undefined,
 ): void {
 	const metadata = (error as SdkErrorMetadata)?.$metadata;
-	const details: Record<string, unknown> = {};
+	const details: JsonObject = {};
 
 	if (typeof metadata?.httpStatusCode === "number") details.status = metadata.httpStatusCode;
 
@@ -512,7 +532,7 @@ function addResponseHeadersMiddleware(
 
 export const streamSimple: StreamFunction<"bedrock-converse-stream", SimpleStreamOptions> = (
 	model: Model<"bedrock-converse-stream">,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
 	const base = {
@@ -694,6 +714,10 @@ function handleMetadata(
 		output.usage.output = event.usage.outputTokens || 0;
 		output.usage.cacheRead = event.usage.cacheReadInputTokens || 0;
 		output.usage.cacheWrite = event.usage.cacheWriteInputTokens || 0;
+		output.usage.cacheWrite1h = event.usage.cacheDetails?.reduce(
+			(total, detail) => total + (detail.ttl === CacheTTL.ONE_HOUR ? (detail.inputTokens ?? 0) : 0),
+			0,
+		);
 		output.usage.totalTokens = event.usage.totalTokens || output.usage.input + output.usage.output;
 		calculateCost(model, output.usage);
 	}
@@ -756,6 +780,22 @@ function supportsAdaptiveThinking(modelId: string, modelName?: string): boolean 
 }
 
 function supportsNativeXhighEffort(model: Model<"bedrock-converse-stream">): boolean {
+	const candidates = getModelMatchCandidates(model.id, model.name);
+	return candidates.some(
+		(s) =>
+			s.includes("opus-4-7") ||
+			s.includes("opus-4-8") ||
+			s.includes("opus-5") ||
+			s.includes("sonnet-5") ||
+			s.includes("fable-5"),
+	);
+}
+
+/**
+ * Check if the model accepts `thinking.block_binding`. Opus 4.6 and Sonnet 4.6 reject it with
+ * "thinking.adaptive.block_binding: Extra inputs are not permitted".
+ */
+function supportsThinkingBlockBinding(model: Model<"bedrock-converse-stream">): boolean {
 	const candidates = getModelMatchCandidates(model.id, model.name);
 	return candidates.some(
 		(s) =>
@@ -899,7 +939,7 @@ function createRequiredTextBlock(text: string): ContentBlock.TextMember {
 	return createNonBlankTextBlock(text) ?? { text: EMPTY_TEXT_PLACEHOLDER };
 }
 
-function sanitizeBedrockDocument(value: DocumentType): DocumentType {
+function sanitizeBedrockDocument(value: JsonValue): DocumentType {
 	if (Array.isArray(value)) {
 		return value.map(sanitizeBedrockDocument);
 	}
@@ -918,18 +958,11 @@ function convertToolResultContent(
 ): ToolResultContentBlock[] {
 	const result: ToolResultContentBlock[] = [];
 	for (const c of content) {
-		if (c.type === "image") {
+		if (c.type === "video" || c.type === "audio") {
+			const textBlock = createNonBlankTextBlock(`[${c.type}: ${c.mimeType}]`);
+			if (textBlock) result.push(textBlock);
+		} else if (c.type === "image") {
 			result.push({ image: createImageBlock(c.mimeType, c.data) });
-		} else if (c.type === "video") {
-			const textBlock = createNonBlankTextBlock(
-				`[video:${c.mimeType} omitted: tool result videos are not supported by this API]`,
-			);
-			if (textBlock) result.push(textBlock);
-		} else if (c.type === "audio") {
-			const textBlock = createNonBlankTextBlock(
-				`[audio:${c.mimeType} omitted: tool result audio is not supported by this API]`,
-			);
-			if (textBlock) result.push(textBlock);
 		} else {
 			const textBlock = createNonBlankTextBlock(c.text);
 			if (textBlock) result.push(textBlock);
@@ -940,13 +973,17 @@ function convertToolResultContent(
 }
 
 function convertMessages(
-	context: Context,
+	context: TranscriptContext,
 	model: Model<"bedrock-converse-stream">,
 	cacheRetention: CacheRetention,
 	env?: ProviderEnv,
 ): Message[] {
 	const result: Message[] = [];
-	const transformedMessages = transformMessages(context.messages, model, normalizeToolCallId);
+	const transformedMessages = transformMessages(
+		withoutInitialSystemMessage(context.messages),
+		model,
+		normalizeToolCallId,
+	);
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const m = transformedMessages[i];
@@ -973,10 +1010,7 @@ function convertMessages(
 					}
 					if (content.length === 0) content.push({ text: EMPTY_TEXT_PLACEHOLDER });
 				}
-				result.push({
-					role: ConversationRole.USER,
-					content,
-				});
+				result.push({ role: ConversationRole.USER, content });
 				break;
 			}
 			case "assistant": {
@@ -1086,10 +1120,7 @@ function convertMessages(
 				// Skip the messages we've already processed
 				i = j - 1;
 
-				result.push({
-					role: ConversationRole.USER,
-					content: toolResults,
-				});
+				result.push({ role: ConversationRole.USER, content: toolResults });
 				break;
 			}
 			default:
@@ -1238,11 +1269,21 @@ function buildAdditionalModelRequestFields(
 	if (isAnthropicClaudeModel(model)) {
 		// GovCloud Bedrock currently rejects the Claude thinking.display field.
 		// Omit it there until the GovCloud Converse schema catches up.
-		const display = isGovCloudBedrockTarget(model, options) ? undefined : (options.thinkingDisplay ?? "summarized");
+		const isGovCloud = isGovCloudBedrockTarget(model, options);
+		const display = isGovCloud ? undefined : (options.thinkingDisplay ?? "summarized");
+		// Replayed signed thinking blocks are bound to the system prompt and tools they were
+		// created with. Bedrock 400s on replay after either changes unless stale blocks are
+		// dropped, matching the Anthropic provider. Skipped on GovCloud like display.
+		const useBlockBinding = !isGovCloud && supportsThinkingBlockBinding(model);
 		const result: Record<string, any> = supportsAdaptiveThinking(model.id, model.name)
 			? {
-					thinking: { type: "adaptive", ...(display !== undefined ? { display } : {}) },
+					thinking: {
+						type: "adaptive",
+						...(display !== undefined ? { display } : {}),
+						...(useBlockBinding ? { block_binding: { prefix_mismatch_behavior: "drop_block" } } : {}),
+					},
 					output_config: { effort: mapThinkingLevelToEffort(model, options.reasoning) },
+					...(useBlockBinding ? { anthropic_beta: [THINKING_BINDING_CONTROLS_BETA] } : {}),
 				}
 			: (() => {
 					const defaultBudgets: Record<ThinkingLevel, number> = {
@@ -1274,8 +1315,44 @@ function buildAdditionalModelRequestFields(
 		return result;
 	}
 
+	const candidates = getModelMatchCandidates(model.id, model.name);
+
+	if (candidates.some((s) => s.includes("gpt-oss"))) {
+		return { reasoning_effort: OPENAI_GPT_OSS_EFFORT[options.reasoning] };
+	}
+
+	if (candidates.some((s) => s.includes("gpt-"))) {
+		const mapped = model.thinkingLevelMap?.[options.reasoning];
+		return {
+			reasoning: { effort: typeof mapped === "string" ? mapped : OPENAI_GPT_EFFORT[options.reasoning] },
+		};
+	}
+
 	return undefined;
 }
+
+type OpenAIGptEffort = "low" | "medium" | "high" | "xhigh" | "max";
+type OpenAIGptOssEffort = "low" | "medium" | "high";
+
+/** OpenAI GPT models (GPT-5.x, GPT-6) take a nested `reasoning.effort` and reject `minimal`. */
+const OPENAI_GPT_EFFORT: Record<ThinkingLevel, OpenAIGptEffort> = {
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+};
+
+/** gpt-oss takes a flat `reasoning_effort` and only accepts low, medium and high. */
+const OPENAI_GPT_OSS_EFFORT: Record<ThinkingLevel, OpenAIGptOssEffort> = {
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "high",
+	max: "high",
+};
 
 function createImageBlock(mimeType: string, data: string) {
 	let format: ImageFormat;

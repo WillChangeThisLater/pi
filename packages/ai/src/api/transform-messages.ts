@@ -13,30 +13,20 @@ import type {
 
 const NON_VISION_USER_IMAGE_PLACEHOLDER = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER = "(tool image omitted: model does not support images)";
-const NON_VIDEO_USER_PLACEHOLDER = "(video omitted: model does not support video input)";
-const NON_AUDIO_USER_PLACEHOLDER = "(audio omitted: model does not support audio input)";
-const NON_VIDEO_TOOL_PLACEHOLDER = "(tool video omitted: model does not support video input)";
-const NON_AUDIO_TOOL_PLACEHOLDER = "(tool audio omitted: model does not support audio input)";
 
-type UnsupportedMediaPlaceholders = { image?: string; video?: string; audio?: string };
-
-function replaceUnsupportedMediaWithPlaceholder(
+function replaceImagesWithPlaceholder(
 	content: (TextContent | ImageContent | VideoContent | AudioContent)[],
-	placeholders: UnsupportedMediaPlaceholders,
-): (TextContent | ImageContent | VideoContent | AudioContent)[] {
-	const result: (TextContent | ImageContent | VideoContent | AudioContent)[] = [];
+	placeholder: string,
+): TextContent[] {
+	// Video/audio blocks are not encodable for this API; convert to text placeholders.
+	const normalized: (TextContent | ImageContent)[] = content.map((b) =>
+		b.type === "video" || b.type === "audio" ? { type: "text", text: `[${b.type}: ${b.mimeType}]` } : b,
+	);
+	const result: TextContent[] = [];
 	let previousWasPlaceholder = false;
 
-	for (const block of content) {
-		const placeholder =
-			block.type === "image"
-				? placeholders.image
-				: block.type === "video"
-					? placeholders.video
-					: block.type === "audio"
-						? placeholders.audio
-						: undefined;
-		if (placeholder) {
+	for (const block of normalized) {
+		if (block.type === "image") {
 			if (!previousWasPlaceholder) {
 				result.push({ type: "text", text: placeholder });
 			}
@@ -45,44 +35,29 @@ function replaceUnsupportedMediaWithPlaceholder(
 		}
 
 		result.push(block);
-		previousWasPlaceholder =
-			block.type === "text" && (block.text === placeholders.image || block.text === placeholders.video);
+		previousWasPlaceholder = block.text === placeholder;
 	}
 
 	return result;
 }
 
-function downgradeUnsupportedMedia<TApi extends Api>(messages: Message[], model: Model<TApi>): Message[] {
-	const supportsImage = model.input.includes("image");
-	const supportsVideo = model.input.includes("video");
-	const supportsAudio = model.input.includes("audio");
-	if (supportsImage && supportsVideo && supportsAudio) {
+function downgradeUnsupportedImages<TApi extends Api>(messages: Message[], model: Model<TApi>): Message[] {
+	if (model.input.includes("image")) {
 		return messages;
 	}
-
-	const userPlaceholders: UnsupportedMediaPlaceholders = {
-		...(supportsImage ? {} : { image: NON_VISION_USER_IMAGE_PLACEHOLDER }),
-		...(supportsVideo ? {} : { video: NON_VIDEO_USER_PLACEHOLDER }),
-		...(supportsAudio ? {} : { audio: NON_AUDIO_USER_PLACEHOLDER }),
-	};
-	const toolPlaceholders: UnsupportedMediaPlaceholders = {
-		...(supportsImage ? {} : { image: NON_VISION_TOOL_IMAGE_PLACEHOLDER }),
-		...(supportsVideo ? {} : { video: NON_VIDEO_TOOL_PLACEHOLDER }),
-		...(supportsAudio ? {} : { audio: NON_AUDIO_TOOL_PLACEHOLDER }),
-	};
 
 	return messages.map((msg) => {
 		if (msg.role === "user" && Array.isArray(msg.content)) {
 			return {
 				...msg,
-				content: replaceUnsupportedMediaWithPlaceholder(msg.content, userPlaceholders),
+				content: replaceImagesWithPlaceholder(msg.content, NON_VISION_USER_IMAGE_PLACEHOLDER),
 			};
 		}
 
 		if (msg.role === "toolResult") {
 			return {
 				...msg,
-				content: replaceUnsupportedMediaWithPlaceholder(msg.content, toolPlaceholders),
+				content: replaceImagesWithPlaceholder(msg.content, NON_VISION_TOOL_IMAGE_PLACEHOLDER),
 			};
 		}
 
@@ -105,12 +80,12 @@ export function transformMessages<TApi extends Api>(
 	// Normalize null/undefined content from untyped callers (custom tools, hand-built
 	// histories, old session files) so downstream code can rely on the type contract.
 	const normalizedMessages = messages.map((msg) => (msg.content == null ? { ...msg, content: [] } : msg));
-	const imageAwareMessages = downgradeUnsupportedMedia(normalizedMessages, model);
+	const imageAwareMessages = downgradeUnsupportedImages(normalizedMessages, model);
 
 	// First pass: transform messages (unsupported image downgrade, thinking blocks, tool call ID normalization)
 	const transformed = imageAwareMessages.map((msg) => {
-		// User messages pass through unchanged
-		if (msg.role === "user") {
+		// System and user messages pass through unchanged
+		if (msg.role === "system" || msg.role === "user") {
 			return msg;
 		}
 
@@ -194,7 +169,11 @@ export function transformMessages<TApi extends Api>(
 	const result: Message[] = [];
 	let pendingToolCalls: ToolCall[] = [];
 	let existingToolResultIds = new Set<string>();
-	const insertSyntheticToolResults = () => {
+	// System messages are transparent to tool-call accounting: one that lands between a tool
+	// call and its results is held back and emitted after the results (synthetic ones
+	// included), so it never causes a duplicate result for a call that is answered later.
+	const heldSystemMessages: Message[] = [];
+	const closePendingToolCalls = () => {
 		if (pendingToolCalls.length > 0) {
 			for (const tc of pendingToolCalls) {
 				if (!existingToolResultIds.has(tc.id)) {
@@ -211,6 +190,8 @@ export function transformMessages<TApi extends Api>(
 			pendingToolCalls = [];
 			existingToolResultIds = new Set();
 		}
+		result.push(...heldSystemMessages);
+		heldSystemMessages.length = 0;
 	};
 
 	for (let i = 0; i < transformed.length; i++) {
@@ -218,7 +199,7 @@ export function transformMessages<TApi extends Api>(
 
 		if (msg.role === "assistant") {
 			// If we have pending orphaned tool calls from a previous assistant, insert synthetic results now
-			insertSyntheticToolResults();
+			closePendingToolCalls();
 
 			// Skip errored/aborted assistant messages entirely.
 			// These are incomplete turns that shouldn't be replayed:
@@ -241,9 +222,15 @@ export function transformMessages<TApi extends Api>(
 		} else if (msg.role === "toolResult") {
 			existingToolResultIds.add(msg.toolCallId);
 			result.push(msg);
+		} else if (msg.role === "system") {
+			if (pendingToolCalls.length > 0) {
+				heldSystemMessages.push(msg);
+			} else {
+				result.push(msg);
+			}
 		} else if (msg.role === "user") {
-			// User message interrupts tool flow - insert synthetic results for orphaned calls
-			insertSyntheticToolResults();
+			// A new user turn interrupts tool flow - insert synthetic results for orphaned calls
+			closePendingToolCalls();
 			result.push(msg);
 		} else {
 			result.push(msg);
@@ -251,7 +238,7 @@ export function transformMessages<TApi extends Api>(
 	}
 
 	// If the conversation ends with unresolved tool calls, synthesize results now.
-	insertSyntheticToolResults();
+	closePendingToolCalls();
 
 	return result;
 }

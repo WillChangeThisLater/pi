@@ -7,7 +7,7 @@
  * OpenAI Responses API generates IDs in format: {call_id}|{id}
  * where {id} can be 400+ chars with special characters (+, /, =).
  *
- * Regression test for: https://github.com/earendil-works/pi-mono/issues/1022
+ * Regression test for: https://github.com/earendil-works/pi/issues/1022
  */
 
 import { Type } from "typebox";
@@ -205,7 +205,7 @@ describe("Tool Call ID Normalization - Prefilled Context", () => {
 			],
 			api: "openai-responses",
 			provider: "github-copilot",
-			model: "gpt-5.5",
+			model: "gpt-5.2-codex",
 			usage: {
 				input: 100,
 				output: 50,

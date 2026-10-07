@@ -471,8 +471,9 @@ class DictationSession {
 
 	private setEditorBorderColor(color: string | null): void {
 		// Older pi builds lack setEditorBorderColor; stay compatible.
-		if (typeof (this.ctx.ui as { setEditorBorderColor?: unknown }).setEditorBorderColor !== "function") return;
-		this.ctx.ui.setEditorBorderColor(color);
+		const ui = this.ctx.ui as { setEditorBorderColor?: (color: string | null) => void };
+		if (typeof ui.setEditorBorderColor !== "function") return;
+		ui.setEditorBorderColor(color);
 	}
 
 	private teardown(): void {

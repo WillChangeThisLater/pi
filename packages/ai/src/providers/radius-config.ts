@@ -8,7 +8,7 @@ export type RadiusGatewayModel = {
 	name: string;
 	reasoning: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
-	input: ("text" | "image" | "video" | "audio")[];
+	input: ("text" | "image")[];
 	cost: Model<"pi-messages">["cost"];
 	contextWindow: number;
 	maxTokens: number;

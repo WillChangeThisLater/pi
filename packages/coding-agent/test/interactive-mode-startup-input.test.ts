@@ -3,6 +3,7 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 type SubmitContext = {
 	defaultEditor: { onSubmit?: (text: string) => void };
+	expandFileReferences: (this: SubmitContext, text: string) => Promise<{ text: string; media?: unknown[] }>;
 	editor: {
 		addToHistory?: (text: string) => void;
 		setText: (text: string) => void;
@@ -31,7 +32,8 @@ type StartupSubmitContext = {
 type InteractiveModePrivate = {
 	handleStartupSubmit(this: StartupSubmitContext, text: string): void;
 	setupEditorSubmitHandler(this: SubmitContext): void;
-	getUserInput(this: InputContext): Promise<string>;
+	expandFileReferences(this: SubmitContext, text: string): Promise<{ text: string; media?: unknown[] }>;
+	getUserInput(this: InputContext): Promise<{ text: string; media?: unknown[] }>;
 };
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrivate;
@@ -51,6 +53,7 @@ function createSubmitContext(): SubmitContext {
 		},
 		flushPendingBashComponents: vi.fn(),
 		pendingUserInputs: [],
+		expandFileReferences: async (text: string) => ({ text }),
 	};
 }
 
@@ -83,7 +86,7 @@ describe("InteractiveMode startup input", () => {
 			pendingUserInputs: ["queued prompt"],
 		};
 
-		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toBe("queued prompt");
+		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toEqual({ text: "queued prompt" });
 		expect(context.onInputCallback).toBeUndefined();
 		expect(context.pendingUserInputs).toEqual([]);
 	});

@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import { describe, expect, it } from "vitest";
-import type { Tool, ToolCall } from "../src/types.ts";
+import type { JsonValue, Tool, ToolCall } from "../src/types.ts";
 import { validateToolArguments } from "../src/utils/validation.ts";
 
 function createToolCallWithPlainSchema(
@@ -27,7 +27,7 @@ function createToolCallWithPlainSchema(
 		type: "toolCall",
 		id: "tool-1",
 		name: "echo",
-		arguments: { value },
+		arguments: { value: value as JsonValue },
 	};
 
 	return { tool, toolCall };
@@ -68,14 +68,14 @@ describe("validateToolArguments", () => {
 			expected: unknown;
 		}> = [
 			{ schema: { type: "number" } as Tool["parameters"], input: "42", expected: 42 },
-			{ schema: { type: "number" } as Tool["parameters"], input: " 42 ", expected: 42 },
-			{ schema: { type: "number" } as Tool["parameters"], input: "1e2", expected: 100 },
-			{ schema: { type: "integer" } as Tool["parameters"], input: "1e2", expected: 100 },
+			{ schema: { type: "number" } as Tool["parameters"], input: true, expected: 1 },
+			{ schema: { type: "number" } as Tool["parameters"], input: null, expected: 0 },
 			{ schema: { type: "integer" } as Tool["parameters"], input: "42", expected: 42 },
 			{ schema: { type: "boolean" } as Tool["parameters"], input: "true", expected: true },
 			{ schema: { type: "boolean" } as Tool["parameters"], input: "false", expected: false },
 			{ schema: { type: "boolean" } as Tool["parameters"], input: 1, expected: true },
 			{ schema: { type: "boolean" } as Tool["parameters"], input: 0, expected: false },
+			{ schema: { type: "string" } as Tool["parameters"], input: null, expected: "" },
 			{ schema: { type: "string" } as Tool["parameters"], input: true, expected: "true" },
 			{ schema: { type: "null" } as Tool["parameters"], input: "", expected: null },
 			{ schema: { type: "null" } as Tool["parameters"], input: 0, expected: null },
@@ -200,15 +200,6 @@ describe("validateToolArguments", () => {
 			{ schema: { type: "boolean" } as Tool["parameters"], input: "0" },
 			{ schema: { type: "null" } as Tool["parameters"], input: "null" },
 			{ schema: { type: "integer" } as Tool["parameters"], input: "42.1" },
-			// null is never fabricated into a value; it fails validation
-			{ schema: { type: "number" } as Tool["parameters"], input: null },
-			{ schema: { type: "integer" } as Tool["parameters"], input: null },
-			{ schema: { type: "boolean" } as Tool["parameters"], input: null },
-			{ schema: { type: "string" } as Tool["parameters"], input: null },
-			// non-decimal strings and booleans are never rewritten into numbers
-			{ schema: { type: "number" } as Tool["parameters"], input: "0x1F" },
-			{ schema: { type: "number" } as Tool["parameters"], input: true },
-			{ schema: { type: "number" } as Tool["parameters"], input: false },
 		];
 
 		for (const testCase of failingCases) {

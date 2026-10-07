@@ -139,13 +139,6 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			await session.prompt(message);
 		}
 
-		if (structuredOutputSchema) {
-			const result = await extractStructuredOutput(session, structuredOutputSchema);
-			const json = process.stdout.isTTY ? JSON.stringify(result, null, 2) : JSON.stringify(result);
-			writeRawStdout(`${json}\n`);
-			return exitCode;
-		}
-
 		if (mode === "text") {
 			const state = session.state;
 			const lastMessage = state.messages[state.messages.length - 1];
@@ -163,6 +156,14 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 					}
 				}
 			}
+		}
+
+		// Forced structured output: run the schema-conformant report extraction and print only JSON.
+		if (structuredOutputSchema) {
+			const result = await extractStructuredOutput(session, structuredOutputSchema);
+			const json = process.stdout.isTTY ? JSON.stringify(result, null, 2) : JSON.stringify(result);
+			writeRawStdout(`${json}\n`);
+			return exitCode;
 		}
 
 		return exitCode;

@@ -3,7 +3,6 @@ import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
 	AudioContent,
-	Context,
 	DeferredCancelOptions,
 	DeferredFetchOptions,
 	DeferredHandle,
@@ -17,10 +16,12 @@ import type {
 	ThinkingContent,
 	ToolCall,
 	ToolResultMessage,
+	TranscriptContext,
 	Usage,
 	VideoContent,
 } from "../types.ts";
 import { createAssistantMessageEventStream } from "../utils/event-stream.ts";
+import { getSystemMessageText } from "../utils/text.ts";
 
 const DEFAULT_API = "faux";
 const DEFAULT_PROVIDER = "faux";
@@ -43,7 +44,8 @@ export interface FauxModelDefinition {
 	id: string;
 	name?: string;
 	reasoning?: boolean;
-	input?: ("text" | "image" | "video" | "audio")[];
+	input?: ("text" | "image")[];
+	inputLimits?: Model<string>["inputLimits"];
 	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	contextWindow?: number;
 	maxTokens?: number;
@@ -93,9 +95,9 @@ export function fauxAssistantMessage(
 		model: DEFAULT_MODEL_ID,
 		usage: DEFAULT_USAGE,
 		stopReason: options.stopReason ?? "stop",
-		deferred: options.deferred,
-		errorMessage: options.errorMessage,
-		responseId: options.responseId,
+		...(options.deferred === undefined ? {} : { deferred: options.deferred }),
+		...(options.errorMessage === undefined ? {} : { errorMessage: options.errorMessage }),
+		...(options.responseId === undefined ? {} : { responseId: options.responseId }),
 		timestamp: options.timestamp ?? Date.now(),
 	};
 }
@@ -107,7 +109,7 @@ export interface FauxProviderState {
 }
 
 export type FauxResponseFactory = (
-	context: Context,
+	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
 	state: FauxProviderState,
 	model: Model<string>,
@@ -173,10 +175,10 @@ function contentToText(content: string | Array<TextContent | ImageContent | Vide
 				return block.text;
 			}
 			if (block.type === "video") {
-				return `[video:${block.mimeType}:${block.data.length}]`;
+				return `[video:${block.mimeType}]`;
 			}
 			if (block.type === "audio") {
-				return `[audio:${block.mimeType}:${block.data.length}]`;
+				return `[audio:${block.mimeType}]`;
 			}
 			return `[image:${block.mimeType}:${block.data.length}]`;
 		})
@@ -202,6 +204,15 @@ function toolResultToText(message: ToolResultMessage): string {
 }
 
 function messageToText(message: Message): string {
+	if (message.role === "system") {
+		return [
+			getSystemMessageText(message),
+			...(message.toolsRemoved?.map((tool) => `tool-:${JSON.stringify(tool)}`) ?? []),
+			...(message.toolsAdded?.map((tool) => `tool+:${JSON.stringify(tool)}`) ?? []),
+		]
+			.filter((part) => part.length > 0)
+			.join("\n");
+	}
 	if (message.role === "user") {
 		return contentToText(message.content);
 	}
@@ -211,18 +222,23 @@ function messageToText(message: Message): string {
 	return toolResultToText(message);
 }
 
-function serializeContext(context: Context): string {
-	const parts: string[] = [];
-	if (context.systemPrompt) {
-		parts.push(`system:${context.systemPrompt}`);
-	}
-	for (const message of context.messages) {
-		parts.push(`${message.role}:${messageToText(message)}`);
-	}
-	if (context.tools?.length) {
-		parts.push(`tools:${JSON.stringify(context.tools)}`);
-	}
-	return parts.join("\n\n");
+/** Length of the prompt text that joins `messages` with blank lines. */
+function joinedLength(messages: readonly string[], count = messages.length): number {
+	let length = count > 0 ? (count - 1) * 2 : 0;
+	for (let index = 0; index < count; index++) length += messages[index]!.length;
+	return length;
+}
+
+/**
+ * Length of the common prefix of the two joined prompts. Equal messages are compared whole; characters are compared
+ * only from the first message that differs.
+ */
+function commonPromptPrefixLength(previous: readonly string[], current: readonly string[]): number {
+	let index = 0;
+	while (index < previous.length && index < current.length && previous[index] === current[index]) index++;
+	const rest = (messages: readonly string[]) =>
+		index === messages.length ? "" : (index > 0 ? "\n\n" : "") + messages.slice(index).join("\n\n");
+	return joinedLength(previous, index) + commonPrefixLength(rest(previous), rest(current));
 }
 
 function commonPrefixLength(a: string, b: string): number {
@@ -236,12 +252,14 @@ function commonPrefixLength(a: string, b: string): number {
 
 function withUsageEstimate(
 	message: AssistantMessage,
-	context: Context,
+	context: TranscriptContext,
 	options: StreamOptions | undefined,
-	promptCache: Map<string, string>,
+	promptCache: Map<string, readonly string[]>,
 ): AssistantMessage {
-	const promptText = serializeContext(context);
-	const promptTokens = estimateTokens(promptText);
+	// One text per message; the whole prompt joins them with blank lines.
+	const prompt = context.messages.map((message) => `${message.role}:${messageToText(message)}`);
+	const promptLength = joinedLength(prompt);
+	const promptTokens = Math.ceil(promptLength / 4);
 	const outputTokens = estimateTokens(assistantContentToText(message.content));
 	let input = promptTokens;
 	let cacheRead = 0;
@@ -251,14 +269,14 @@ function withUsageEstimate(
 	if (sessionId && options?.cacheRetention !== "none") {
 		const previousPrompt = promptCache.get(sessionId);
 		if (previousPrompt) {
-			const cachedChars = commonPrefixLength(previousPrompt, promptText);
-			cacheRead = estimateTokens(previousPrompt.slice(0, cachedChars));
-			cacheWrite = estimateTokens(promptText.slice(cachedChars));
+			const cachedChars = commonPromptPrefixLength(previousPrompt, prompt);
+			cacheRead = Math.ceil(cachedChars / 4);
+			cacheWrite = Math.ceil((promptLength - cachedChars) / 4);
 			input = Math.max(0, promptTokens - cacheRead);
 		} else {
 			cacheWrite = promptTokens;
 		}
-		promptCache.set(sessionId, promptText);
+		promptCache.set(sessionId, prompt);
 	}
 
 	return {
@@ -452,13 +470,13 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 	let pendingResponses: FauxResponseStep[] = [];
 	const tokensPerSecond = options.tokensPerSecond;
 	const state: FauxProviderState = { callCount: 0, deferredFetchCount: 0, cancelledDeferred: [] };
-	const promptCache = new Map<string, string>();
+	const promptCache = new Map<string, readonly string[]>();
 	const deferredResponses = new Map<
 		string,
 		{
 			handle: DeferredHandle;
 			step: FauxResponseStep;
-			context: Context;
+			context: TranscriptContext;
 			options: SimpleStreamOptions | undefined;
 			model: Model<string>;
 			pendingFetches: number;
@@ -474,7 +492,7 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 					id: DEFAULT_MODEL_ID,
 					name: DEFAULT_MODEL_NAME,
 					reasoning: false,
-					input: ["text", "image"] as ("text" | "image" | "video" | "audio")[],
+					input: ["text", "image"] as ("text" | "image")[],
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow: 128000,
 					maxTokens: 16384,
@@ -488,6 +506,7 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 		baseUrl: DEFAULT_BASE_URL,
 		reasoning: definition.reasoning ?? false,
 		input: definition.input ?? ["text", "image"],
+		inputLimits: definition.inputLimits,
 		cost: definition.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: definition.contextWindow ?? 128000,
 		maxTokens: definition.maxTokens ?? 16384,
@@ -495,7 +514,7 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 
 	const resolveResponse = async (
 		step: FauxResponseStep,
-		context: Context,
+		context: TranscriptContext,
 		streamOptions: SimpleStreamOptions | undefined,
 		requestModel: Model<string>,
 	): Promise<AssistantMessage> => {

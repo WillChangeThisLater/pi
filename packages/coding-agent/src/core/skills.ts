@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
@@ -79,8 +78,6 @@ export interface Skill {
 	baseDir: string;
 	sourceInfo: SourceInfo;
 	disableModelInvocation: boolean;
-	/** Short sha256 of SKILL.md contents at load time (derived, not authored). */
-	contentHash?: string;
 }
 
 export interface LoadSkillsResult {
@@ -285,10 +282,8 @@ function loadSkillFromFile(
 	const isDeclaredSkill = basename(filePath) === "SKILL.md";
 
 	let rawContent: string;
-	let contentHash: string | undefined;
 	try {
 		rawContent = readFileSync(filePath, "utf-8");
-		contentHash = createHash("sha256").update(rawContent, "utf-8").digest("hex").slice(0, 12);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "failed to read skill file";
 		diagnostics.push({ type: "warning", message, path: filePath });
@@ -344,7 +339,6 @@ function loadSkillFromFile(
 			baseDir: skillDir,
 			sourceInfo: createSkillSourceInfo(filePath, skillDir, source),
 			disableModelInvocation: frontmatter["disable-model-invocation"] === true,
-			contentHash,
 		},
 		diagnostics,
 	};
@@ -357,8 +351,11 @@ function loadSkillFromFile(
  *
  * Skills with disableModelInvocation=true are excluded from the prompt
  * (they can only be invoked explicitly via /skill:name commands).
+ *
+ * `fileReadTool` names the tool that loads skill files; `indirect` names none, for a reader that
+ * is reachable only through another tool.
  */
-export function formatSkillsForPrompt(skills: Skill[]): string {
+export function formatSkillsForPrompt(skills: Skill[], fileReadTool: "read" | "bash" | "indirect" = "read"): string {
 	const visibleSkills = skills.filter((s) => !s.disableModelInvocation);
 
 	if (visibleSkills.length === 0) {
@@ -367,7 +364,11 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 
 	const lines = [
 		"\n\nThe following skills provide specialized instructions for specific tasks.",
-		"Use the read tool to load a skill's file when the task matches its description.",
+		fileReadTool === "read"
+			? "Use the read tool to load a skill's file when the task matches its description."
+			: fileReadTool === "bash"
+				? "Use bash to load a skill's file when the task matches its description."
+				: "Load a skill's file when the task matches its description.",
 		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
 		"",
 		"<available_skills>",
@@ -378,9 +379,6 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
 		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
 		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
-		if (skill.contentHash) {
-			lines.push(`    <version>${escapeXml(skill.contentHash)}</version>`);
-		}
 		lines.push("  </skill>");
 	}
 
