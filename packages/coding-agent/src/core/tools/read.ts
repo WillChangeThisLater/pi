@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { basename, dirname, isAbsolute, relative, resolve as resolvePath, sep } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
@@ -37,6 +38,12 @@ export type ReadToolInput = Static<typeof readSchema>;
 
 export interface ReadToolDetails {
 	truncation?: TruncationResult;
+	/** Short sha256 of the full file contents as read from disk (pre-truncation). Log-only; never sent to the model. */
+	fileHash?: string;
+	/** Absolute path of the file that was read. */
+	filePath?: string;
+	/** ISO timestamp of when the file was read. */
+	readAt?: string;
 }
 
 interface CompactReadClassification {
@@ -306,6 +313,8 @@ export function createReadToolDefinition(
 							} else {
 								// Read text content.
 								const buffer = await ops.readFile(absolutePath);
+								const fileHash = createHash("sha256").update(buffer).digest("hex").slice(0, 12);
+								const fileReadAt = new Date().toISOString();
 								const textContent = buffer.toString("utf-8");
 								const allLines = textContent.split("\n");
 								const totalFileLines = allLines.length;
@@ -355,6 +364,7 @@ export function createReadToolDefinition(
 									outputText = truncation.content;
 								}
 								content = [{ type: "text", text: outputText }];
+								details = { ...(details ?? {}), fileHash, filePath: absolutePath, readAt: fileReadAt };
 							}
 
 							if (aborted) return;

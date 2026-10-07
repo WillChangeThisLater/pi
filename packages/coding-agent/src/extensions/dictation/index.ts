@@ -91,15 +91,25 @@ function pcmToWav(pcm: Buffer): Buffer {
 	return Buffer.concat([header, pcm]);
 }
 
-/** RMS amplitude of s16le PCM (0..32768). Guards against transcribing silence. */
+/**
+ * RMS amplitude of s16le PCM (0..32768), measured over the trailing 10s of
+ * audio (the most recent speech, not the start of the recording). Guards
+ * against transcribing silence. Measuring from the buffer start instead
+ * freezes the gate on the first 10s forever: once the buffer grows past 10s
+ * the value never changes, so speech arriving later can never re-open the
+ * gate and dictation goes permanently mute while capture continues.
+ */
 function rms(pcm: Buffer): number {
-	const n = Math.min(pcm.length >> 1, SAMPLE_RATE * 10);
+	const maxSamples = SAMPLE_RATE * 10;
+	const totalSamples = pcm.length >> 1;
+	const count = Math.min(totalSamples, maxSamples);
+	const start = (totalSamples - count) * 2;
 	let sum = 0;
-	for (let i = 0; i < n; i++) {
-		const v = pcm.readInt16LE(i * 2);
+	for (let i = 0; i < count; i++) {
+		const v = pcm.readInt16LE(start + i * 2);
 		sum += v * v;
 	}
-	return n === 0 ? 0 : Math.sqrt(sum / n);
+	return count === 0 ? 0 : Math.sqrt(sum / count);
 }
 
 const SILENCE_RMS = Number(process.env.PI_DICTATION_SILENCE_RMS) || 250; // ~-42dBFS; room tone ~30-80, speech 1000+
@@ -164,6 +174,7 @@ class DictationSession {
 	private pcmChunks: Buffer[] = [];
 	private timer: ReturnType<typeof setInterval> | null = null;
 	private runInFlight = false;
+	private heardSpeech = false;
 	private lastPartial = "";
 	private savedEditorText = "";
 	private tmpDir: string | null = null;
@@ -319,7 +330,12 @@ class DictationSession {
 	/** Re-run the backend on everything captured so far; stream result into the editor. */
 	private async emitPartial(): Promise<void> {
 		if (this.runInFlight || this.pcmSoFar().length < SAMPLE_RATE) return; // <1s: skip
-		if (rms(this.pcmSoFar()) < SILENCE_RMS) return; // silence: skip partial
+		const level = rms(this.pcmSoFar());
+		if (level < SILENCE_RMS) {
+			this.log("silence-skip", `rms=${Math.round(level)} threshold=${SILENCE_RMS}`);
+			return; // silence: skip partial
+		}
+		this.heardSpeech = true;
 		this.runInFlight = true;
 		try {
 			const pcm = this.pcmSoFar();
@@ -358,7 +374,10 @@ class DictationSession {
 		if (this.autoSubmitTriggered) return; // stop-word path owns this session now
 		const finalPcm = this.pcmSoFar();
 		this.stopCapture();
-		if (rms(finalPcm) < SILENCE_RMS) {
+		// Only cancel as silence if we never heard speech. A trailing-window rms
+		// check alone would discard a session where the user paused just before
+		// committing.
+		if (!this.heardSpeech && rms(finalPcm) < SILENCE_RMS) {
 			// No speech detected (silence gate): cancel quietly instead of letting the
 			// backend hallucinate text from room tone.
 			this.log("silence-cancel", `rms=${Math.round(rms(finalPcm))} threshold=${SILENCE_RMS}`);

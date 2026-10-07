@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "fs";
 import ignore from "ignore";
 import { basename, dirname, join, relative, resolve, sep } from "path";
@@ -78,6 +79,8 @@ export interface Skill {
 	baseDir: string;
 	sourceInfo: SourceInfo;
 	disableModelInvocation: boolean;
+	/** Short sha256 of SKILL.md contents at load time (derived, not authored). */
+	contentHash?: string;
 }
 
 export interface LoadSkillsResult {
@@ -282,8 +285,10 @@ function loadSkillFromFile(
 	const isDeclaredSkill = basename(filePath) === "SKILL.md";
 
 	let rawContent: string;
+	let contentHash: string | undefined;
 	try {
 		rawContent = readFileSync(filePath, "utf-8");
+		contentHash = createHash("sha256").update(rawContent, "utf-8").digest("hex").slice(0, 12);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : "failed to read skill file";
 		diagnostics.push({ type: "warning", message, path: filePath });
@@ -339,6 +344,7 @@ function loadSkillFromFile(
 			baseDir: skillDir,
 			sourceInfo: createSkillSourceInfo(filePath, skillDir, source),
 			disableModelInvocation: frontmatter["disable-model-invocation"] === true,
+			contentHash,
 		},
 		diagnostics,
 	};
@@ -372,6 +378,9 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
 		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
 		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+		if (skill.contentHash) {
+			lines.push(`    <version>${escapeXml(skill.contentHash)}</version>`);
+		}
 		lines.push("  </skill>");
 	}
 

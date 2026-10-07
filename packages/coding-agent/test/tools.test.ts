@@ -76,7 +76,11 @@ describe("Coding Agent Tools", () => {
 			expect(getTextOutput(result)).toBe(content);
 			// No truncation message since file fits within limits
 			expect(getTextOutput(result)).not.toContain("Use offset=");
-			expect(result.details).toBeUndefined();
+			// File metadata lives in details only — never in the model-visible content
+			expect(result.details).toMatchObject({ filePath: testFile });
+			expect(result.details?.fileHash).toMatch(/^[0-9a-f]{12}$/);
+			expect(result.details?.readAt).toBeTruthy();
+			expect(getTextOutput(result)).not.toContain(result.details!.fileHash!);
 		});
 
 		it("should handle non-existent files", async () => {
