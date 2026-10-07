@@ -34,6 +34,12 @@
  *     2. "dictation.stopWords" in ~/.pi/agent/settings.json (array or string)
  *     3. built-in default: ["peacock"]
  *   An empty list (env or settings) disables stop-word detection.
+ *
+ * Dictation tagging:
+ *   Committed/submitted transcripts are wrapped in <dictated>...</dictated> so the model can
+ *   tell them apart from typed input. Once dictation has been used in a session, a matching
+ *   "dictation" prompt section explains the tag once instead of repeating it per message.
+ *   Partials stream into the editor unwrapped; only the final text is tagged.
  */
 
 import { type ChildProcess, execSync, spawn } from "node:child_process";
@@ -70,6 +76,23 @@ function sentenceCase(text: string): string {
 function normalizeTranscript(text: string): string {
 	if ((process.env.PI_DICTATION_CASE ?? "sentence") === "keep") return text.trim();
 	return sentenceCase(text);
+}
+
+/**
+ * Prompt section explaining the `<dictated>` tag. Added once dictation has been used this
+ * session, so the model reads dictated text correctly without the notice repeating on every
+ * message. See {@link wrapDictated}.
+ */
+export const DICTATION_NOTICE =
+	"Messages wrapped in <dictated>...</dictated> were produced by speech-to-text. Expect " +
+	"misspellings, missing punctuation, run-ons, pauses, and stutters. Infer the intended meaning " +
+	"instead of commenting on transcription errors, and ask for clarification only when it " +
+	"materially changes what you do.";
+
+/** Tag committed/submitted dictated text so the model can tell it apart from typed input. */
+export function wrapDictated(text: string): string {
+	const trimmed = text.trim();
+	return trimmed ? `<dictated>\n${trimmed}\n</dictated>` : text;
 }
 
 /** Wrap raw s16le PCM bytes in a minimal WAV container (44-byte header). */
@@ -168,6 +191,7 @@ class DictationSession {
 	private stopPhraseRes: RegExp[];
 	private pi: ExtensionAPI;
 	private onEnded: () => void;
+	private onDictated: () => void;
 	private autoSubmitTriggered = false;
 
 	private arecord: ChildProcess | null = null;
@@ -191,6 +215,7 @@ class DictationSession {
 			stopWords: string[];
 			pi: ExtensionAPI;
 			onEnded: () => void;
+			onDictated: () => void;
 		},
 	) {
 		this.ctx = ctx;
@@ -201,9 +226,15 @@ class DictationSession {
 		this.stopPhraseRes = compileStopPhrases(opts.stopWords);
 		this.pi = opts.pi;
 		this.onEnded = opts.onEnded;
+		this.onDictated = opts.onDictated;
 	}
 
-	static async start(ctx: ExtensionContext, pi: ExtensionAPI, onEnded: () => void): Promise<DictationSession | null> {
+	static async start(
+		ctx: ExtensionContext,
+		pi: ExtensionAPI,
+		onEnded: () => void,
+		onDictated: () => void,
+	): Promise<DictationSession | null> {
 		const backend = process.env.PI_DICTATION_BACKEND || defaultBackend();
 		if (!backend) {
 			ctx.ui.notify(
@@ -220,6 +251,7 @@ class DictationSession {
 			stopWords: loadStopWords(),
 			pi,
 			onEnded,
+			onDictated,
 		});
 		session.savedEditorText = ctx.ui.getEditorText();
 		await session.begin();
@@ -399,7 +431,10 @@ class DictationSession {
 	private finalize(text: string): void {
 		this.stopCapture();
 		this.log("commit", text || "(silence)");
-		if (text) this.applyEditor(text);
+		if (text) {
+			this.onDictated();
+			this.applyEditor(wrapDictated(text));
+		}
 		this.teardown();
 	}
 
@@ -431,7 +466,8 @@ class DictationSession {
 			this.onEnded();
 			return;
 		}
-		const message = normalizeTranscript(before);
+		const message = wrapDictated(normalizeTranscript(before));
+		this.onDictated();
 		this.ctx.ui.setEditorText(this.savedEditorText); // clear the partials from the editor
 		this.teardown();
 		this.onEnded();
@@ -491,10 +527,16 @@ export default function (pi: ExtensionAPI) {
 	let lastCtx: ExtensionContext | null = null;
 	let inputBound = false;
 	let holdStarting: Promise<DictationSession | null> | null = null;
+	// Set once the user has dictated in this session; gates the one-time prompt section.
+	let dictatedThisSession = false;
 
 	/** Clear the session ref when the session ends itself (stop-word auto-submit). */
 	function onSessionEnded(): void {
 		session = null;
+	}
+
+	function onDictated(): void {
+		dictatedThisSession = true;
 	}
 
 	/** Classify a space-bar event from raw terminal input, or null if not space. */
@@ -510,7 +552,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function startHold(ctx: ExtensionContext): void {
-		holdStarting = DictationSession.start(ctx, pi, onSessionEnded)
+		holdStarting = DictationSession.start(ctx, pi, onSessionEnded, onDictated)
 			.then((s) => {
 				session = s;
 				return s;
@@ -580,6 +622,14 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.onTerminalInput(handleTerminalInput);
 	});
 
+	// Explain the <dictated> tag once the user has actually dictated (or the prompt itself is
+	// tagged), so the notice does not burden sessions that never use dictation.
+	pi.on("before_agent_start", (event) => {
+		if (dictatedThisSession || event.prompt.includes("<dictated>")) {
+			event.systemPromptOptions.sections.dictation = DICTATION_NOTICE;
+		}
+	});
+
 	async function toggle(ctx: ExtensionContext): Promise<void> {
 		if (holdStarting) return; // hold in flight; let the release handle it
 		if (session) {
@@ -588,7 +638,7 @@ export default function (pi: ExtensionAPI) {
 			await s.commit();
 			return;
 		}
-		session = await DictationSession.start(ctx, pi, onSessionEnded);
+		session = await DictationSession.start(ctx, pi, onSessionEnded, onDictated);
 	}
 
 	pi.registerShortcut("ctrl+space", {
@@ -611,5 +661,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		session?.cancel();
 		session = null;
+		dictatedThisSession = false;
 	});
 }
