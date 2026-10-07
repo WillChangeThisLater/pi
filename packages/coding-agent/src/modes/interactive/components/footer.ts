@@ -260,6 +260,23 @@ export class FooterComponent implements Component {
 			}
 		}
 
+		// Append the current model's $in/$out per-1M-token rates when they're known and fit.
+		// Dropped entirely on overflow — a truncated price reads wrong; the /model
+		// selector's full pricing detail line is the fallback view.
+		const cost = state.model?.cost;
+		if (cost && (cost.input > 0 || cost.output > 0)) {
+			const fmtRate = (rate: number) =>
+				rate >= 100
+					? rate.toFixed(0)
+					: rate >= 1
+						? String(Number(rate.toFixed(2)))
+						: rate.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+			const costBadge = ` $${fmtRate(cost.input)}/${fmtRate(cost.output)}`;
+			if (statsLeftWidth + minPadding + visibleWidth(rightSide) + visibleWidth(costBadge) <= width) {
+				rightSide += costBadge;
+			}
+		}
+
 		const rightSideWidth = visibleWidth(rightSide);
 		const totalNeeded = statsLeftWidth + minPadding + rightSideWidth;
 

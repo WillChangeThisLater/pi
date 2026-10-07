@@ -35,6 +35,17 @@ interface DefaultModelReference {
 
 type ModelScope = "all" | "scoped";
 
+/** Compact $/1M-token rate rendering: $0.35, $3, $12.5 — drops trailing zeros beyond 2 decimals. */
+function trimRates(rate: number): string {
+	if (!Number.isFinite(rate)) return "?";
+	if (rate === 0) return "0";
+	return rate >= 100
+		? rate.toFixed(0)
+		: rate >= 1
+			? String(Number(rate.toFixed(2)))
+			: rate.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
+}
+
 /**
  * Component that renders a model selector with search
  */
@@ -329,7 +340,13 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const providerBadge = theme.fg("muted", `[${item.provider}]`);
 			const icons = modalityIconsFor(item.model.input);
 			const iconBadge = icons ? theme.fg("muted", ` ${icons}`) : "";
-			const line = `${cursor}${currentMarker}${modelText} ${providerBadge}${iconBadge}${defaultBadge}`;
+			// Per-row pricing badge: $in/$out per 1M tokens, only when rates are known
+			const costRates = item.model.cost;
+			const costBadge =
+				costRates && (costRates.input > 0 || costRates.output > 0)
+					? theme.fg("muted", ` $${trimRates(costRates.input)}/${trimRates(costRates.output)}`)
+					: "";
+			const line = `${cursor}${currentMarker}${modelText} ${providerBadge}${iconBadge}${defaultBadge}${costBadge}`;
 
 			this.listContainer.addChild(new Text(line, 0, 0));
 		}
@@ -353,6 +370,21 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const selected = this.filteredModels[this.selectedIndex];
 			this.listContainer.addChild(new Spacer(1));
 			this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));
+			// Selected-model pricing detail: full per-1M-token rates incl. cache
+			const selectedCost = selected.model.cost;
+			if (selectedCost) {
+				const fmt = (rate: number) => (rate > 0 ? `$${trimRates(rate)}` : "free");
+				this.listContainer.addChild(
+					new Text(
+						theme.fg(
+							"muted",
+							`  Pricing (per 1M tokens): in ${fmt(selectedCost.input)} · out ${fmt(selectedCost.output)} · cacheR ${fmt(selectedCost.cacheRead)} · cacheW ${fmt(selectedCost.cacheWrite)}`,
+						),
+						0,
+						0,
+					),
+				);
+			}
 		}
 		if (this.refreshStatusMessage) {
 			this.listContainer.addChild(new Spacer(1));

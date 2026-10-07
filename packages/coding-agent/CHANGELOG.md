@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Model pricing visibility: `/model` selector rows show a muted `$in/$out` per-1M-token badge (when rates are known) with a full `Pricing (per 1M tokens)` detail line for the selected model; the footer's model line now appends the current model's `$in/$out` rates, dropped entirely rather than truncated when the terminal is narrow
+
 ### Fixed
 
 - Dictation hold-to-talk: check kitty key repeat/release before the space press match so space releases (e.g. `\x1b[32;1:3u`) are no longer misclassified as presses, which previously consumed every space event and made commit-on-release unreachable in kitty-protocol terminals
