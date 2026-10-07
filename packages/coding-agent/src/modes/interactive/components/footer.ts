@@ -6,6 +6,7 @@ import type { ContextUsage } from "../../../core/extensions/types.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
 import { addUsageToTotals, createUsageTotals, type UsageTotals } from "../../../core/usage-totals.ts";
 import { theme } from "../theme/theme.ts";
+import { modalityIconsFor } from "./modality-icons.ts";
 
 /**
  * Sanitize text for display in a single-line status.
@@ -251,6 +252,12 @@ export class FooterComponent implements Component {
 		}
 
 		// Prepend the provider in parentheses if there are multiple providers and there's enough room
+		// Add input modality icons: picture, audio, video support
+		const modalityIcons = modalityIconsFor(state.model?.input);
+		if (modalityIcons) {
+			rightSideWithoutProvider = `${rightSideWithoutProvider} ${modalityIcons}`;
+		}
+
 		let rightSide = rightSideWithoutProvider;
 		if (this.footerData.getAvailableProviderCount() > 1 && state.model) {
 			rightSide = `(${state.model!.provider}) ${rightSideWithoutProvider}`;

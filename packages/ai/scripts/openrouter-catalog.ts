@@ -26,13 +26,34 @@ export interface OpenRouterCatalog {
 	classifiers: ClassifierModel<"typesafe-system-one">[];
 }
 
+/** Input modalities declared by a model definition. */
+export type InputModality = "text" | "image" | "video" | "audio";
+
+/**
+ * Map a models.dev/OpenRouter input-modality list to our input union, always
+ * including text. Video and audio input declarations are preserved so the
+ * TUI can surface them (and so media attachments are not needlessly rejected).
+ */
+export function inputMods(mods?: string[]): InputModality[] {
+	const input: InputModality[] = ["text"];
+	if (mods?.includes("image")) input.push("image");
+	if (mods?.includes("video")) input.push("video");
+	if (mods?.includes("audio")) input.push("audio");
+	return input;
+}
+
 function roundCost(value: number): number {
 	return Number(value.toFixed(6));
 }
 
-function modalities(values: string[] | undefined): ("text" | "image")[] {
+function modalities(values: string[] | undefined): ("text" | "image" | "video" | "audio")[] {
 	return Array.from(
-		new Set((values ?? []).filter((value): value is "text" | "image" => value === "text" || value === "image")),
+		new Set(
+			(values ?? []).filter(
+				(value): value is "text" | "image" | "video" | "audio" =>
+					value === "text" || value === "image" || value === "video" || value === "audio",
+			),
+		),
 	);
 }
 
@@ -63,11 +84,12 @@ export function buildOpenRouterCatalog(
 	for (const model of listed) {
 		// Only include models that support tools
 		if (!model.supported_parameters?.includes("tools")) continue;
-		// Parse input modalities
-		const input: ("text" | "image")[] = ["text"];
-		if (model.architecture?.modality?.includes("image")) {
-			input.push("image");
-		}
+		// Parse input modalities. Prefer input_modalities when present; fall back to
+		// the legacy "text->image" modality string. Video/audio declarations are kept.
+		const input = inputMods(
+			model.architecture?.input_modalities ??
+				model.architecture?.modality?.split("->")[0]?.split(","),
+		);
 
 		const thinkingLevelMap = getOpenRouterThinkingLevelMap(model.reasoning);
 		const useAnthropicMessages = /^anthropic\//.test(model.id) && !model.id.endsWith(":batch");
@@ -90,7 +112,9 @@ export function buildOpenRouterCatalog(
 	const images: OpenRouterCatalog["images"] = [];
 	for (const model of imageListed) {
 		if (images.some((entry) => entry.id === model.id)) continue;
-		const output = modalities(model.architecture?.output_modalities);
+		const output = modalities(model.architecture?.output_modalities).filter(
+			(value): value is "text" | "image" => value === "text" || value === "image",
+		);
 		if (!output.includes("image")) continue;
 		const input = modalities(model.architecture?.input_modalities);
 		images.push({
