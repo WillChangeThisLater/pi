@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 import type { Skill } from "../src/core/skills.ts";
 import { createSyntheticSourceInfo } from "../src/core/source-info.ts";
-import { buildSystemPrompt } from "../src/core/system-prompt.ts";
+import { buildSystemPrompt, buildSystemPromptSections, diffSystemPromptSections } from "../src/core/system-prompt.ts";
 
 const testSkill: Skill = {
 	name: "test-skill",
@@ -34,6 +34,63 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt).toContain("Show file paths clearly");
+		});
+	});
+
+	describe("model identity", () => {
+		test("injects provider/model and input media when provided", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: [],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+				model: { provider: "z-ai", id: "glm-5.3-flash", inputMedia: ["image", "video"] },
+			});
+
+			expect(prompt).toContain("you are z-ai/glm-5.3-flash");
+			expect(prompt).toContain("input media: image, video");
+			expect(prompt).toContain("best guess");
+		});
+
+		test("falls back to text when no non-text media", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: [],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+				model: { provider: "openai", id: "gpt-4o-mini", inputMedia: [] },
+			});
+
+			expect(prompt).toContain("you are openai/gpt-4o-mini");
+			expect(prompt).toContain("input media: text");
+		});
+
+		test("omits identity section when no model provided", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: [],
+				contextFiles: [],
+				skills: [],
+				cwd: process.cwd(),
+			});
+
+			expect(prompt).not.toContain("Model identity");
+		});
+
+		test("emits a tagged model_identity section and diffs it as a one-shot update", () => {
+			const options = { selectedTools: [], contextFiles: [], skills: [], cwd: "/tmp" };
+			const physical = buildSystemPromptSections({
+				...options,
+				model: { provider: "anthropic", id: "claude-sonnet-4-5", inputMedia: ["image"] },
+			});
+			expect(physical.model_identity).toContain("<model_identity>");
+
+			// Dropping to a virtual selection removes the section instead of asserting a false identity.
+			const virtual = buildSystemPromptSections({ ...options, model: undefined });
+			const patch = diffSystemPromptSections(physical, virtual);
+			expect(patch).toEqual({ model_identity: null });
+
+			// A steady model produces no update at all.
+			expect(diffSystemPromptSections(physical, physical)).toBeUndefined();
 		});
 	});
 

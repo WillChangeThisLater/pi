@@ -13,6 +13,7 @@ import {
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { describe, expect, test } from "vitest";
+import type { CustomMessage } from "../src/core/messages.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -22,7 +23,7 @@ import {
 	diffSystemPromptSections,
 } from "../src/core/system-prompt.ts";
 import type { ExtensionFactory } from "../src/index.ts";
-import { createHarness } from "./suite/harness.ts";
+import { createHarness, getMessageText } from "./suite/harness.ts";
 
 describe("system prompt updates", () => {
 	test("declares the prompt and tools once and reuses them across resume", async () => {
@@ -45,7 +46,14 @@ describe("system prompt updates", () => {
 			const head = harness.session.messages[0];
 			if (head?.role !== "system") throw new Error("expected system message");
 			expect(head.content).toBe("");
-			expect(Object.keys(head.sections ?? {})).toEqual(["preamble", "tools", "rules", "docs", "cwd"]);
+			expect(Object.keys(head.sections ?? {})).toEqual([
+				"preamble",
+				"tools",
+				"rules",
+				"docs",
+				"model_identity",
+				"cwd",
+			]);
 			expect(head.toolsAdded?.map((tool) => tool.name)).toEqual(["read", "bash", "edit", "write"]);
 			expect(getSystemMessageText(head)).toBe(harness.session.systemPrompt);
 		} finally {
@@ -296,6 +304,44 @@ describe("system prompt updates", () => {
 			harness.session.agent.state.messages = JSON.parse(JSON.stringify(harness.session.messages));
 			await harness.session.prompt("two");
 			expect(harness.session.messages.filter((message) => message.role === "system")).toHaveLength(1);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	test("injects model identity and a visible model_change notice on a manual switch", async () => {
+		const harness = await createHarness({
+			models: [
+				{ id: "faux-one", input: ["text"] },
+				{ id: "faux-two", input: ["text", "image"] },
+			],
+		});
+		try {
+			harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+			await harness.session.prompt("one");
+
+			const head = harness.session.messages[0];
+			if (head?.role !== "system") throw new Error("expected system message");
+			expect(head.sections?.model_identity).toContain("faux-one");
+
+			const next = harness.models[1];
+			await harness.session.setModel(next);
+			await harness.session.prompt("two");
+
+			// The identity section is patched mid-conversation to the new model and its media.
+			const current = getCurrentSystemMessage(harness.session.messages);
+			expect(current?.sections?.model_identity).toContain("faux-two");
+			expect(current?.sections?.model_identity).toContain("image");
+
+			// A single visible transition notice carries the old and new identity.
+			const notices = harness.session.messages.filter(
+				(message): message is CustomMessage =>
+					message.role === "custom" && message.customType === "pi.model_change",
+			);
+			expect(notices).toHaveLength(1);
+			expect(notices[0]?.display).toBe(true);
+			expect(getMessageText(notices[0])).toContain("faux-one");
+			expect(getMessageText(notices[0])).toContain("faux-two");
 		} finally {
 			harness.cleanup();
 		}

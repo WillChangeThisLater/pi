@@ -112,3 +112,23 @@ export class CustomMessageComponent extends Container {
 		);
 	}
 }
+
+/**
+ * Built-in renderers for core-emitted custom messages. Extension renderers take precedence;
+ * these keep harness bookkeeping (e.g. model switches) to a compact one-liner instead of the
+ * default labeled box.
+ */
+export function getBuiltinMessageRenderer(customType: string): MessageRenderer | undefined {
+	if (customType !== "pi.model_change") return undefined;
+	return (message, _options, activeTheme) => {
+		const details = message.details as
+			| { previousProvider?: string; previousModelId?: string; provider?: string; modelId?: string }
+			| undefined;
+		const from =
+			details?.previousProvider && details?.previousModelId
+				? `${details.previousProvider}/${details.previousModelId}`
+				: "?";
+		const to = details?.provider && details?.modelId ? `${details.provider}/${details.modelId}` : "?";
+		return new Text(activeTheme.fg("muted", `↳ model: ${from} → ${to}`), 0, 0);
+	};
+}

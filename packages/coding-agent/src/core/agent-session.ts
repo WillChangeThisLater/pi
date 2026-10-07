@@ -141,6 +141,7 @@ import {
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
+	type BuildSystemPromptOptions,
 	buildSystemPrompt,
 	buildSystemPromptSections,
 	diffSystemPromptSections,
@@ -1698,6 +1699,21 @@ export class AgentSession {
 		return Array.from(unique);
 	}
 
+	/**
+	 * The active model's identity for the `model_identity` prompt section. Undefined under a
+	 * virtual selection: the physical model is not known until the request is routed, so any
+	 * identity claim here would name the router instead of the model that actually answers.
+	 */
+	private _modelIdentityOption(): BuildSystemPromptOptions["model"] {
+		const model = this.model;
+		if (!model || isVirtualModel(model)) return undefined;
+		return {
+			provider: model.provider,
+			id: model.id,
+			inputMedia: model.input.filter((modality) => modality !== "text"),
+		};
+	}
+
 	private _rebuildSystemPrompt(toolNames: string[]): void {
 		const validToolNames = toolNames.filter((name) => this._toolRegistry.has(name));
 		const toolSnippets: Record<string, string> = {};
@@ -1715,6 +1731,7 @@ export class AgentSession {
 
 		this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
 			cwd: this._cwd,
+			model: this._modelIdentityOption(),
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
@@ -1740,6 +1757,9 @@ export class AgentSession {
 		options: NormalizedBuildSystemPromptOptions,
 		messages: AgentMessage[] = this.agent.state.messages,
 	): SystemMessage | undefined {
+		// Keep the model-identity section current before diffing, so a model switch surfaces
+		// as a one-shot system-message update and a steady model adds nothing.
+		options.model = this._modelIdentityOption();
 		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
 		// The tool list and rules must match the declarations the request carries.
 		options.hiddenTools = [...this._hiddenDeclarations];
@@ -2478,6 +2498,43 @@ export class AgentSession {
 	}
 
 	/**
+	 * Reflect a user-initiated model change in the prompt options and tell the model about the
+	 * transition on its next turn. Virtual routing changes the serving model per request without
+	 * passing through here, so this only fires on deliberate `set`/`cycle` switches.
+	 */
+	private async _onActiveModelChanged(previous: Model<any> | undefined, next: Model<any>): Promise<void> {
+		// Keep `getSystemPromptOptions()` and `ctx.getSystemPrompt()` accurate before the next prompt.
+		this._baseSystemPromptOptions.model = this._modelIdentityOption();
+		if (!previous || modelsAreEqual(previous, next)) return;
+
+		const describeMedia = (model: Model<any>): string => {
+			const media = model.input.filter((modality) => modality !== "text");
+			return media.length > 0 ? media.join(", ") : "text only";
+		};
+		// Cycling through several models before the next turn should read as one net transition.
+		this._pendingNextTurnMessages = this._pendingNextTurnMessages.filter(
+			(message) => message.customType !== "pi.model_change",
+		);
+		await this.sendCustomMessage(
+			{
+				customType: "pi.model_change",
+				content:
+					`[Model switched: ${previous.provider}/${previous.id} -> ${next.provider}/${next.id}. ` +
+					`Based on pi's model registry, this model's input media: ${describeMedia(next)}; ` +
+					"treat this as a best guess.]",
+				display: true,
+				details: {
+					previousProvider: previous.provider,
+					previousModelId: previous.id,
+					provider: next.provider,
+					modelId: next.id,
+				},
+			},
+			{ deliverAs: "nextTurn" },
+		);
+	}
+
+	/**
 	 * Set model directly.
 	 * Validates that auth is configured and saves to the session transcript.
 	 * Persists to global defaults only when options.persist is true.
@@ -2502,6 +2559,7 @@ export class AgentSession {
 		// Model persistence does not implicitly rewrite the global thinking default.
 		this.setThinkingLevel(thinkingLevel);
 
+		await this._onActiveModelChanged(previousModel, model);
 		await this._emitModelSelect(model, previousModel, "set");
 	}
 
@@ -2571,6 +2629,7 @@ export class AgentSession {
 		// Model persistence does not implicitly rewrite the global thinking default.
 		this.setThinkingLevel(thinkingLevel);
 
+		await this._onActiveModelChanged(currentModel, next.model);
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
@@ -2603,6 +2662,7 @@ export class AgentSession {
 		// Model persistence does not implicitly rewrite the global thinking default.
 		this.setThinkingLevel(thinkingLevel);
 
+		await this._onActiveModelChanged(currentModel, nextModel);
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
