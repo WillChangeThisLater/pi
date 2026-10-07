@@ -17,11 +17,15 @@ This is a fork of [badlogic/pi-mono](https://github.com/badlogic/pi-mono) that e
 - **Video and audio input support**: new video/audio content types flow through the whole stack — `pi-ai` (multimodal request encoding), `pi-protocol`/`pi-server` (transcript protocol), and `pi-coding-agent` (attachments, MIME handling, file processing). Attach video and audio files to prompts like images.
 - **TUI modality indicators**: the model selector and footer show which input modalities (text, image, video, audio) the currently selected model supports, so you always know what you can send.
 - **Model-aware system prompt**: pi injects the current model's identity and input capabilities into the system prompt, and notifies the model when you switch models mid-session — the agent knows what it is and what media it can accept.
-- **Dictation (push-to-talk STT)**: the [`extensions/dictation`](extensions/dictation) extension adds push-to-talk speech-to-text to the prompt editor. Hold a key, speak, and the transcript streams into your prompt live via a configurable backend command (`PI_DICTATION_BACKEND`, e.g. `whisper-cli`, `arecord`+STT, any external recognizer). Includes a streaming UI overlay, partial transcripts, and a test rig with fixture audio. See the [dictation README](extensions/dictation/README.md).
+- **Dictation (push-to-talk STT)**: the built-in `dictation` extension (`packages/coding-agent/src/extensions/dictation/`) adds push-to-talk speech-to-text to the prompt editor. Hold a key, speak, and the transcript streams into your prompt live via a configurable backend command (`PI_DICTATION_BACKEND`, e.g. `whisper-cli`, `arecord`+STT, any external recognizer). Includes partial transcripts and stop-word hands-free submit. See the extension's header comment for setup.
 - **Vi editing mode**: `set -o vi` style editing in the prompt editor ([`packages/tui`](packages/tui)).
+- **Human-readable session ids**: session ids are AT-themed readable names (`springer-katahdin-4217`), shown in the footer and session pickers ([`packages/coding-agent/src/utils/session-names.ts`](packages/coding-agent/src/utils/session-names.ts)).
+- **Model pricing visibility**: the `/model` selector and the footer show per-model `$in/$out` per-1M-token rates (when known), so routing economics are visible live.
 - **Fork tooling**: [`scripts/sync-upstream.sh`](scripts/sync-upstream.sh) to pull upstream changes while rebasing in-progress feature branches.
 
-Every fork feature listed above was implemented end-to-end by AI agents (using pi itself) — no human-written code. The fork-specific rules they operated under are in [AGENTS.md](AGENTS.md).
+## Provenance
+
+Every fork feature listed above was implemented end-to-end by AI agents (using pi itself). Paul (fork owner) directs the work — feature design, trade-offs, priorities — and verifies behavior (live TUI tests, eval runs, pre-commit checks), but does not write or maintain the TypeScript and does not review it line-by-line. Treat all fork-specific code as AI-generated and exercised-by-agent unless a commit says otherwise. The merge-regression fixes in `120518d2c` are the same story: an agent merged upstream, an agent found and restored the dropped hooks. The rules agents operate under in this repo are in [AGENTS.md](AGENTS.md).
 
 Keeping in sync with upstream: `git remote add upstream https://github.com/badlogic/pi-mono && ./scripts/sync-upstream.sh`.
 
