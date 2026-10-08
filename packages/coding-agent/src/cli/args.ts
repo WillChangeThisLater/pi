@@ -52,7 +52,8 @@ export interface Args {
 	verbose?: boolean;
 	projectTrustOverride?: boolean;
 	messages: string[];
-	schema?: string; // JSON Schema file (or "-" for stdin); with -p, forces the final result to conform
+	schema?: string; // JSON Schema (file, "-", inline JSON, or shorthand DSL); with -p, forces the final result to conform
+	schemaMulti?: string; // Like schema, but wraps the schema in an items array for multiple results
 	fileArgs: string[];
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
 	unknownFlags: Map<string, boolean | string>;
@@ -225,6 +226,8 @@ export function parseArgs(args: string[]): Args {
 			}
 		} else if (arg === "--schema" && i + 1 < args.length) {
 			result.schema = args[++i];
+		} else if (arg === "--schema-multi" && i + 1 < args.length) {
+			result.schemaMulti = args[++i];
 		} else if (arg === "--tui-mode") {
 			const mode = args[i + 1];
 			if (mode === "regular" || mode === "fullscreen") {
@@ -308,6 +311,8 @@ ${chalk.bold("Options:")}
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
+  --schema <spec>                Force conformant JSON output; spec is a JSON Schema file, "-" (stdin), inline JSON, or shorthand DSL (e.g. "name string, points int")
+  --schema-multi <spec>          Like --schema, but wraps the schema in an items array for multiple results
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID

@@ -41,41 +41,135 @@ Call the "${REPORT_TOOL_NAME}" tool exactly once. Its arguments must conform to 
 const EXTRACTION_INSTRUCTION = `Based on the conversation above, call the "${REPORT_TOOL_NAME}" tool with the final result conforming to the requested schema.`;
 
 /**
- * Load a JSON Schema from a file path, or from stdin when the spec is "-".
- * Returns the parsed schema; throws with a user-facing message on failure.
+ * Build a JSON Schema from llm's shorthand DSL (ported from llm's
+ * `schema_dsl`, utils.py):
+ *   - fields separated by commas or newlines
+ *   - each field is "name type" (space-separated), type optional (default string)
+ *   - an optional ": description" suffix is copied to the property
+ *   - type indicators: int, float, bool, str (mapped to integer/number/boolean/string)
+ * Unrecognised type indicators fall back to string (matching llm).
  */
-export function loadStructuredOutputSchema(spec: string): Record<string, unknown> {
-	let raw: string;
-	try {
-		raw = spec === "-" ? readFileSync(0, "utf8") : readFileSync(spec, "utf8");
-	} catch (error) {
-		const detail = error instanceof Error ? error.message : String(error);
-		throw new Error(`Failed to read --schema "${spec}": ${detail}`);
+function schemaDsl(dsl: string): Record<string, unknown> {
+	const typeMapping: Record<string, string> = {
+		int: "integer",
+		float: "number",
+		bool: "boolean",
+		str: "string",
+	};
+
+	const fields = dsl.includes("\n")
+		? dsl
+				.split("\n")
+				.map((f) => f.trim())
+				.filter(Boolean)
+		: dsl
+				.split(",")
+				.map((f) => f.trim())
+				.filter(Boolean);
+
+	const properties: Record<string, Record<string, unknown>> = {};
+	const required: string[] = [];
+
+	for (const field of fields) {
+		let fieldInfo = field;
+		let description = "";
+		const colon = field.indexOf(":");
+		if (colon !== -1) {
+			fieldInfo = field.slice(0, colon);
+			description = field.slice(colon + 1).trim();
+		}
+
+		const parts = fieldInfo.trim().split(/\s+/).filter(Boolean);
+		if (parts.length === 0) {
+			continue;
+		}
+		const fieldName = parts[0];
+		let fieldType = "string";
+		if (parts.length > 1 && parts[1] in typeMapping) {
+			fieldType = typeMapping[parts[1]];
+		}
+
+		const prop: Record<string, unknown> = { type: fieldType };
+		if (description) {
+			prop.description = description;
+		}
+		properties[fieldName] = prop;
+		required.push(fieldName);
 	}
 
+	return { type: "object", properties, required };
+}
+
+/** Wrap a schema in an items array (llm's --schema-multi semantics). */
+function multiSchema(schema: Record<string, unknown>): Record<string, unknown> {
+	return {
+		type: "object",
+		properties: { items: { type: "array", items: schema } },
+		required: ["items"],
+	};
+}
+
+function parseJsonSchema(raw: string, label: string): Record<string, unknown> {
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
-		throw new Error(`--schema "${spec}" is not valid JSON: ${detail}`);
+		throw new Error(`--schema (${label}) is not valid JSON: ${detail}`);
 	}
 
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-		throw new Error(`--schema "${spec}" must be a JSON Schema object`);
+		throw new Error(`--schema (${label}) must be a JSON Schema object`);
 	}
-	const schema = parsed as Record<string, unknown>;
+	return parsed as Record<string, unknown>;
+}
 
-	// Fail fast (before spending tokens) if the schema cannot be converted to the
-	// strict subset used by provider constrained sampling.
+/**
+ * Fail fast (before spending tokens) if the schema cannot be converted to the
+ * strict subset used by provider constrained sampling. Returns the schema.
+ */
+function validateStrict(schema: Record<string, unknown>, spec: string): Record<string, unknown> {
 	try {
 		makeStrictJsonSchema(schema as Tool["parameters"]);
 	} catch (error) {
 		const detail = error instanceof Error ? error.message : String(error);
 		throw new Error(`--schema "${spec}" is not supported for strict structured output: ${detail}`);
 	}
-
 	return schema;
+}
+
+/**
+ * Load a JSON Schema from a file path, stdin ("-"), inline JSON, or shorthand
+ * DSL ("field string, points int: points on HN"). When `multi` is true the
+ * schema is wrapped in an items array (llm's --schema-multi semantics).
+ * Throws with a user-facing message on failure.
+ */
+export function loadStructuredOutputSchema(spec: string, multi = false): Record<string, unknown> {
+	const trimmed = spec.trim();
+
+	let schema: Record<string, unknown>;
+	if (spec === "-") {
+		schema = parseJsonSchema(readFileSync(0, "utf8"), "<stdin>");
+	} else if (trimmed.startsWith("{")) {
+		schema = parseJsonSchema(spec, "inline JSON");
+	} else if (/[\s,]/.test(trimmed)) {
+		// Shorthand DSL wins over a file path that happens to contain a space/comma.
+		schema = schemaDsl(spec);
+	} else {
+		let raw: string;
+		try {
+			raw = readFileSync(spec, "utf8");
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			throw new Error(`Failed to read --schema "${spec}": ${detail}`);
+		}
+		schema = parseJsonSchema(raw, spec);
+	}
+
+	if (multi) {
+		schema = multiSchema(schema);
+	}
+	return validateStrict(schema, spec);
 }
 
 function buildReportTool(schema: Record<string, unknown>): Tool {

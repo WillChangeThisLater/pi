@@ -139,7 +139,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			await session.prompt(message);
 		}
 
-		if (mode === "text") {
+		if (mode === "text" && !structuredOutputSchema) {
 			const state = session.state;
 			const lastMessage = state.messages[state.messages.length - 1];
 

@@ -663,13 +663,16 @@ export async function main(args: string[], options?: MainOptions) {
 	validateSessionIdFlags(parsed);
 
 	let structuredOutputSchema: Record<string, unknown> | undefined;
-	if (parsed.schema) {
+	const schemaSpec = parsed.schemaMulti ?? parsed.schema;
+	const schemaIsMulti = parsed.schemaMulti !== undefined;
+	if (schemaSpec) {
 		if (appMode !== "print") {
-			console.error(chalk.red("Error: --schema is only supported in print mode (-p)"));
+			const flag = schemaIsMulti ? "--schema-multi" : "--schema";
+			console.error(chalk.red(`Error: ${flag} is only supported in print mode (-p)`));
 			process.exit(1);
 		}
 		try {
-			structuredOutputSchema = loadStructuredOutputSchema(parsed.schema);
+			structuredOutputSchema = loadStructuredOutputSchema(schemaSpec, schemaIsMulti);
 		} catch (error) {
 			console.error(chalk.red(`Error: ${error instanceof Error ? error.message : String(error)}`));
 			process.exit(1);
