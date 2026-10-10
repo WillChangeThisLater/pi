@@ -23,7 +23,7 @@ export interface ProcessedFiles {
 }
 
 export interface ProcessFileOptions {
-	/** Whether to auto-resize images to 2000x2000 max. Default: true */
+	/** Whether to auto-resize images. Default: true */
 	autoResizeImages?: boolean;
 	/** Whether to exit the process on missing/unreadable files. Default: true (CLI behavior). Set false for interactive use. */
 	exitOnError?: boolean;

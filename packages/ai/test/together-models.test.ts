@@ -22,7 +22,7 @@ describe("Together models", () => {
 		expect(model.baseUrl).toBe("https://api.together.ai/v1");
 		expect(model.reasoning).toBe(true);
 		expect(model.thinkingLevelMap).toEqual({ minimal: null, low: null, medium: null });
-		expect(model.input).toEqual(["text", "image"]);
+		expect(model.input).toEqual(["text", "image", "video"]);
 		expect(model.contextWindow).toBe(1048576);
 		expect(model.maxTokens).toBe(131072);
 		expect(model.cost).toEqual({

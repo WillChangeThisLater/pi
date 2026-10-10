@@ -187,6 +187,7 @@ import { UserMessageSelectorComponent } from "./components/user-message-selector
 import { editInExternalEditor } from "./external-editor.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
+import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
 import { shareSession } from "./session-share.ts";
 import {
 	getAvailableThemes,
@@ -550,6 +551,12 @@ export class InteractiveMode {
 
 	// Shutdown state
 	private shutdownRequested = false;
+
+	/** Reports working, blocked, done, and error states to terminals that support OSC 7501. */
+	private readonly programStatus = new ProgramStatusReporter(
+		() => this.ui.terminal,
+		() => this.sessionManager.getSessionName(),
+	);
 
 	/** The `/bug` hint is shown at most once per session so error output stays readable. */
 	private bugReportHintShown = false;
@@ -997,6 +1004,7 @@ export class InteractiveMode {
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
 		this.isInitialized = true;
+		this.programStatus.report();
 		this.ensurePngTranscoder();
 
 		this.themeController.applyFromSettings();
@@ -2091,6 +2099,7 @@ export class InteractiveMode {
 
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.programStatus.reset();
 		this.applyRuntimeSettings();
 
 		if (options.renderBeforeBind) {
@@ -2697,6 +2706,7 @@ export class InteractiveMode {
 		title: string,
 		options: string[],
 		opts?: ExtensionUIDialogOptions,
+		blocked: BlockedStatus = { kind: "question", message: title },
 	): Promise<string | undefined> {
 		return new Promise((resolve) => {
 			if (opts?.signal?.aborted) {
@@ -2730,6 +2740,8 @@ export class InteractiveMode {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionSelector);
 			this.ui.setFocus(this.extensionSelector);
+			// Extension dialogs share the editor slot: opening one replaces the status of a displaced one.
+			this.programStatus.setBlocked("extension-dialog", blocked);
 			this.ui.requestRender();
 		});
 	}
@@ -2742,6 +2754,7 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionSelector = undefined;
+		this.programStatus.setBlocked("extension-dialog", undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -2754,7 +2767,10 @@ export class InteractiveMode {
 		message: string,
 		opts?: ExtensionUIDialogOptions,
 	): Promise<boolean> {
-		const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], opts);
+		const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], opts, {
+			kind: "permission",
+			message: title,
+		});
 		return result === "Yes";
 	}
 
@@ -2806,6 +2822,7 @@ export class InteractiveMode {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionInput);
 			this.ui.setFocus(this.extensionInput);
+			this.programStatus.setBlocked("extension-dialog", { kind: "question", message: title });
 			this.ui.requestRender();
 		});
 	}
@@ -2818,6 +2835,7 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionInput = undefined;
+		this.programStatus.setBlocked("extension-dialog", undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -2848,6 +2866,7 @@ export class InteractiveMode {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionEditor);
 			this.ui.setFocus(this.extensionEditor);
+			this.programStatus.setBlocked("extension-dialog", { kind: "question", message: title });
 			this.ui.requestRender();
 		});
 	}
@@ -2859,6 +2878,7 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionEditor = undefined;
+		this.programStatus.setBlocked("extension-dialog", undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -3409,6 +3429,7 @@ export class InteractiveMode {
 		}
 
 		this.footer.invalidate();
+		this.programStatus.handleEvent(event);
 
 		switch (event.type) {
 			case "agent_start":
@@ -6285,7 +6306,7 @@ export class InteractiveMode {
 		};
 
 		try {
-			await this.loginProvider(dialog, providerId, "api_key");
+			await this.loginProvider(dialog, providerId, providerName, "api_key");
 			restoreEditor();
 			await this.completeProviderAuthentication(providerId, providerName, "api_key", previousModel);
 		} catch (error: unknown) {
@@ -6378,18 +6399,24 @@ export class InteractiveMode {
 	private async loginProvider(
 		dialog: LoginDialogComponent,
 		providerId: string,
+		providerName: string,
 		method: "api_key" | "oauth",
 	): Promise<void> {
-		await this.session.modelRuntime.login(
-			providerId,
-			method,
-			{
-				signal: dialog.signal,
-				prompt: (prompt) => this.showAuthPrompt(dialog, prompt, providerId),
-				notify: (event) => this.notifyAuthDialog(dialog, event),
-			},
-			{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() },
-		);
+		this.programStatus.setBlocked("login", { kind: "auth", message: `Log in to ${providerName}` });
+		try {
+			await this.session.modelRuntime.login(
+				providerId,
+				method,
+				{
+					signal: dialog.signal,
+					prompt: (prompt) => this.showAuthPrompt(dialog, prompt, providerId),
+					notify: (event) => this.notifyAuthDialog(dialog, event),
+				},
+				{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() },
+			);
+		} finally {
+			this.programStatus.setBlocked("login", undefined);
+		}
 	}
 
 	private async showLoginDialog(providerId: string, providerName: string, onBack?: () => void): Promise<void> {
@@ -6408,7 +6435,7 @@ export class InteractiveMode {
 		};
 
 		try {
-			await this.loginProvider(dialog, providerId, "oauth");
+			await this.loginProvider(dialog, providerId, providerName, "oauth");
 			restoreEditor();
 			await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
 			if (providerId === RADIUS_PROVIDER_ID) this.offerRadiusMcpServer(providerId, providerName);

@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSy
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 import { getEffortThinkingLevelMap, type ModelsDevReasoningOption } from "./models-dev-reasoning-options.ts";
+import { type AiGatewayPricing, getAiGatewayCost } from "./ai-gateway-pricing.ts";
 import {
 	buildOpenRouterCatalog,
 	inputMods,
@@ -162,12 +163,7 @@ interface AiGatewayModel {
 	context_window?: number;
 	max_tokens?: number;
 	tags?: string[];
-	pricing?: {
-		input?: string | number;
-		output?: string | number;
-		input_cache_read?: string | number;
-		input_cache_write?: string | number;
-	};
+	pricing?: AiGatewayPricing;
 }
 
 const COPILOT_STATIC_HEADERS = {
@@ -616,7 +612,7 @@ function supportsAnthropicMidConvoEffort(modelId: string): boolean {
 	const id = modelId.toLowerCase().replace(/^~?anthropic\//, "");
 	return (
 		/^claude-opus-(?:5|5[.-]5)(?:-\d{8})?$/.test(id) ||
-		/^claude-sonnet-5[.-]5(?:-\d{8})?$/.test(id) ||
+		/^claude-(?:sonnet|haiku)-5[.-]5(?:-\d{8})?$/.test(id) ||
 		/^claude-(?:fable|mythos)-5(?:[.-]1)(?:-\d{8})?$/.test(id)
 	);
 }
@@ -624,7 +620,7 @@ function supportsAnthropicMidConvoEffort(modelId: string): boolean {
 function supportsAnthropicMidConvoSystemMessages(modelId: string): boolean {
 	return (
 		/^claude-opus-(?:4[.-]8|5(?:[.-]5)?)(?:-\d{8})?$/.test(modelId) ||
-		/^claude-sonnet-5[.-]5(?:-\d{8})?$/.test(modelId) ||
+		/^claude-(?:sonnet|haiku)-5[.-]5(?:-\d{8})?$/.test(modelId) ||
 		/^claude-(?:fable|mythos)-5(?:[.-]1)?(?:-\d{8})?$/.test(modelId)
 	);
 }
@@ -643,6 +639,8 @@ function isAnthropicAdaptiveThinkingModel(modelId: string): boolean {
 		modelId.includes("sonnet-4.6") ||
 		modelId.includes("sonnet-5") ||
 		modelId.includes("sonnet.5") ||
+		modelId.includes("haiku-5") ||
+		modelId.includes("haiku.5") ||
 		modelId.includes("fable-5") ||
 		modelId.includes("mythos-5")
 	);
@@ -658,7 +656,9 @@ function isAnthropicTemperatureUnsupportedModel(modelId: string): boolean {
 		id.includes("opus-5") ||
 		id.includes("opus.5") ||
 		id.includes("sonnet-5-5") ||
-		id.includes("sonnet-5.5")
+		id.includes("sonnet-5.5") ||
+		id.includes("haiku-5-5") ||
+		id.includes("haiku-5.5")
 	);
 }
 
@@ -1097,7 +1097,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	}
 	// Anthropic adaptive-thinking effort support (per Anthropic adaptive thinking docs):
 	// - "max" is available on all adaptive-thinking Claude models.
-	// - "xhigh" is only available on Opus 4.7/4.8/5, Sonnet 5, and Fable 5.
+	// - "xhigh" is only available on Opus 4.7/4.8/5, Sonnet 5, Haiku 5.5, and Fable 5.
 	if (
 		model.id.includes("opus-4-6") ||
 		model.id.includes("opus-4.6") ||
@@ -1114,7 +1114,9 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 		model.id.includes("opus-5") ||
 		model.id.includes("opus.5") ||
 		model.id.includes("sonnet-5") ||
-		model.id.includes("sonnet.5")
+		model.id.includes("sonnet.5") ||
+		model.id.includes("haiku-5") ||
+		model.id.includes("haiku.5")
 	) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh", max: "max" });
 	}
@@ -1269,27 +1271,28 @@ function roundCost(value: number): number {
 }
 
 function getModelsDevCost(cost: ModelsDevModel["cost"]): ModelCost {
+	const base = {
+		input: cost?.input || 0,
+		output: cost?.output || 0,
+		cacheRead: cost?.cache_read || 0,
+		cacheWrite: cost?.cache_write || 0,
+	};
+	// Rates a tier does not list keep the base price.
 	const tiers = cost?.tiers?.flatMap((tier) => {
 		const context = tier.tier;
 		if (context?.type !== "context" || context.size === undefined) return [];
 		return [
 			{
 				inputTokensAbove: context.size,
-				input: tier.input || 0,
-				output: tier.output || 0,
-				cacheRead: tier.cache_read || 0,
-				cacheWrite: tier.cache_write || 0,
+				input: tier.input ?? base.input,
+				output: tier.output ?? base.output,
+				cacheRead: tier.cache_read ?? base.cacheRead,
+				cacheWrite: tier.cache_write ?? base.cacheWrite,
 			},
 		];
 	});
 
-	return {
-		input: cost?.input || 0,
-		output: cost?.output || 0,
-		cacheRead: cost?.cache_read || 0,
-		cacheWrite: cost?.cache_write || 0,
-		...(tiers && tiers.length > 0 ? { tiers } : {}),
-	};
+	return tiers && tiers.length > 0 ? { ...base, tiers } : base;
 }
 
 async function fetchNvidiaNimModelIds(): Promise<Map<string, string>> {
@@ -1411,11 +1414,6 @@ async function fetchAiGatewayModels(): Promise<{
 				input.push("image");
 			}
 
-			const inputCost = roundCost(toNumber(model.pricing?.input) * 1_000_000);
-			const outputCost = roundCost(toNumber(model.pricing?.output) * 1_000_000);
-			const cacheReadCost = roundCost(toNumber(model.pricing?.input_cache_read) * 1_000_000);
-			const cacheWriteCost = roundCost(toNumber(model.pricing?.input_cache_write) * 1_000_000);
-
 			models.push({
 				id: model.id,
 				name: model.name || model.id,
@@ -1425,12 +1423,7 @@ async function fetchAiGatewayModels(): Promise<{
 				reasoning: tags.includes("reasoning"),
 				input,
 				compat: { allowEmptySignature: true },
-				cost: {
-					input: inputCost,
-					output: outputCost,
-					cacheRead: cacheReadCost,
-					cacheWrite: cacheWriteCost,
-				},
+				cost: getAiGatewayCost(model.pricing),
 				contextWindow: model.context_window || 4096,
 				maxTokens: model.max_tokens || 4096,
 			});
@@ -1486,12 +1479,7 @@ function processZaiModels(data: ModelsDevCatalog): Model<Api>[] {
 				reasoning: m.reasoning === true,
 				...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 				input: mods,
-				cost: {
-					input: referenceCost?.input || 0,
-					output: referenceCost?.output || 0,
-					cacheRead: referenceCost?.cache_read || 0,
-					cacheWrite: referenceCost?.cache_write || 0,
-				},
+				cost: getModelsDevCost(referenceCost),
 				compat: {
 					supportsDeveloperRole: false,
 					thinkingFormat: "zai",
@@ -1593,12 +1581,7 @@ function processBasetenModels(provider: ModelsDevProvider | undefined): Model<Ap
 			reasoning,
 			...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 			input: baseenInput,
-			cost: {
-				input: model.cost?.input || 0,
-				output: model.cost?.output || 0,
-				cacheRead: model.cost?.cache_read || 0,
-				cacheWrite: model.cost?.cache_write || 0,
-			},
+			cost: getModelsDevCost(model.cost),
 			compat,
 			contextWindow: model.limit?.context || 4096,
 			maxTokens: model.limit?.output || 4096,
@@ -1631,12 +1614,7 @@ function processGoogleModels(data: ModelsDevCatalog): Model<Api>[] {
 				reasoning: source.reasoning === true,
 				...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 				input: inputMods(source.modalities?.input),
-				cost: {
-					input: source.cost?.input || 0,
-					output: source.cost?.output || 0,
-					cacheRead: source.cost?.cache_read || 0,
-					cacheWrite: source.cost?.cache_write || 0,
-				},
+				cost: getModelsDevCost(source.cost),
 				contextWindow: source.limit?.context || 4096,
 				maxTokens: source.limit?.output || 4096,
 			});
@@ -1719,12 +1697,7 @@ function processFireworksModels(provider: ModelsDevProvider | undefined): Model<
 			provider: "fireworks",
 			reasoning: model.reasoning === true,
 			input,
-			cost: {
-				input: model.cost?.input || 0,
-				output: model.cost?.output || 0,
-				cacheRead: model.cost?.cache_read || 0,
-				cacheWrite: model.cost?.cache_write || 0,
-			},
+			cost: getModelsDevCost(model.cost),
 			contextWindow: model.limit?.context || 4096,
 			maxTokens: model.limit?.output || 4096,
 		};
@@ -1831,12 +1804,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.anthropic.com",
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1862,12 +1830,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.openai.com/v1",
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1889,12 +1852,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.groq.com/openai/v1",
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1916,12 +1874,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.cerebras.ai/v1",
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -1943,12 +1896,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: CLOUDFLARE_WORKERS_AI_BASE_URL,
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 					compat: { sendSessionAffinityHeaders: true },
@@ -2005,12 +1953,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl,
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 					...(compat ? { compat } : {}),
@@ -2040,12 +1983,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: CLOUDFLARE_AI_GATEWAY_COMPAT_BASE_URL,
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 					compat: { sendSessionAffinityHeaders: true },
@@ -2091,12 +2029,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://api.meta.ai/v1",
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -2151,12 +2084,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl: "https://router.huggingface.co/v1",
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					compat: {
 						supportsDeveloperRole: false,
 					},
@@ -2190,12 +2118,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					headers: { ...NVIDIA_HEADERS },
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					compat: NVIDIA_OPENAI_COMPAT,
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
@@ -2223,12 +2146,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					reasoning,
 					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					compat: getTogetherCompat(modelId, reasoning),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
@@ -2340,12 +2258,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					reasoning: m.reasoning === true,
 					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					...(compat ? { compat } : {}),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
@@ -2429,12 +2342,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 						baseUrl,
 						reasoning: m.reasoning === true,
 						input: inputMods(m.modalities?.input),
-						cost: {
-							input: m.cost?.input || 0,
-							output: m.cost?.output || 0,
-							cacheRead: m.cost?.cache_read || 0,
-							cacheWrite: m.cost?.cache_write || 0,
-						},
+						cost: getModelsDevCost(m.cost),
 						contextWindow: m.limit?.context || 4096,
 						maxTokens: m.limit?.output || 4096,
 					});
@@ -2530,12 +2438,15 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					baseUrl,
 					reasoning: isKimiK3 || m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || (isKimiK3 ? KIMI_K3_COST.input : 0),
-						output: m.cost?.output || (isKimiK3 ? KIMI_K3_COST.output : 0),
-						cacheRead: m.cost?.cache_read || (isKimiK3 ? KIMI_K3_COST.cacheRead : 0),
-						cacheWrite: m.cost?.cache_write || (isKimiK3 ? KIMI_K3_COST.cacheWrite : 0),
-					},
+					// Moonshot does not bill cache writes; models.dev lists the input rate as cache_write for Kimi K3.
+					cost: isKimiK3
+						? { ...KIMI_K3_COST }
+						: {
+								input: m.cost?.input || 0,
+								output: m.cost?.output || 0,
+								cacheRead: m.cost?.cache_read || 0,
+								cacheWrite: m.cost?.cache_write || 0,
+							},
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 					compat,
@@ -2589,12 +2500,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					compat: xiaomiCompat,
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -2661,12 +2567,7 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 					...(thinkingLevelMap ? { thinkingLevelMap } : {}),
 					reasoning: m.reasoning === true,
 					input: inputMods(m.modalities?.input),
-					cost: {
-						input: m.cost?.input || 0,
-						output: m.cost?.output || 0,
-						cacheRead: m.cost?.cache_read || 0,
-						cacheWrite: m.cost?.cache_write || 0,
-					},
+					cost: getModelsDevCost(m.cost),
 					contextWindow: m.limit?.context || 4096,
 					maxTokens: m.limit?.output || 4096,
 				});
@@ -2790,6 +2691,27 @@ const CLOUDFLARE_WORKERS_AI_CLASSIFIER_MODELS: ClassifierModel<"cloudflare-worke
 	},
 ];
 
+// OpenAI Decisions API (public beta): gpt-6-luna is its only model. It bills input tokens only,
+// with the same long-context multiplier as chat requests. Only API keys work: Sign in with ChatGPT
+// tokens are rejected on /v1/decisions, and the Codex backend has no Decisions route.
+// The endpoint rejects inputs above 922K tokens (the model's documented maximum input), but
+// requests running longer than about five seconds, currently above roughly 600K input tokens,
+// fail with a gateway timeout.
+// https://developers.openai.com/api/docs/guides/decisions
+const OPENAI_CLASSIFIER_MODELS: ClassifierModel<"openai-decisions">[] = [
+	{
+		type: "classifier",
+		id: "gpt-6-luna",
+		name: "GPT-6 Luna",
+		api: "openai-decisions",
+		provider: "openai",
+		baseUrl: "https://api.openai.com/v1",
+		input: ["text", "image"],
+		cost: withOpenAiLongContextPricing({ input: 0.1, output: 0, cacheRead: 0, cacheWrite: 0 }),
+		contextWindow: 922000,
+	},
+];
+
 async function generateModels() {
 	// Fetch models from all upstream catalogs.
 	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras, and others
@@ -2861,6 +2783,39 @@ async function generateModels() {
 		});
 	}
 
+	// Add Claude Haiku 5.5 until models.dev includes it. Prompts over 100k input tokens
+	// are billed at 5x for the whole request.
+	// https://platform.claude.com/docs/en/models/haiku-5-5/overview
+	if (!allModels.some((model) => model.provider === "anthropic" && model.id === "claude-haiku-5-5")) {
+		allModels.push({
+			id: "claude-haiku-5-5",
+			name: "Claude Haiku 5.5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			thinkingLevelMap: {
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+				max: "max",
+			},
+			input: ["text", "image"],
+			cost: {
+				input: 0.1,
+				output: 0.5,
+				cacheRead: 0.01,
+				cacheWrite: 0.125,
+				tiers: [{ inputTokensAbove: 100000, input: 0.5, output: 2.5, cacheRead: 0.05, cacheWrite: 0.625 }],
+			},
+			contextWindow: 1000000,
+			maxTokens: 128000,
+		});
+	}
+
 	// The authenticated Copilot catalog advertised these models on 2026-09-22,
 	// but models.dev did not include them yet.
 	const missingCopilotModels: Model<Api>[] = [
@@ -2912,10 +2867,12 @@ async function generateModels() {
 			candidate.contextWindow = 1000000;
 		}
 
-		// models.dev may list Opus 5.5 and Sonnet 5.5 before their effort metadata is complete.
+		// models.dev may list Opus 5.5, Sonnet 5.5, and Haiku 5.5 before their effort metadata is complete.
 		if (
 			(candidate.provider === "anthropic" &&
-				(candidate.id === "claude-opus-5-5" || candidate.id === "claude-sonnet-5-5")) ||
+				(candidate.id === "claude-opus-5-5" ||
+					candidate.id === "claude-sonnet-5-5" ||
+					candidate.id === "claude-haiku-5-5")) ||
 			(candidate.provider === "github-copilot" && candidate.id === "claude-opus-5.5")
 		) {
 			mergeThinkingLevelMap(candidate, {
@@ -3517,6 +3474,7 @@ async function generateModels() {
 		...aiGatewayCatalog.classifiers,
 		...OPENCODE_CLASSIFIER_MODELS,
 		...CLOUDFLARE_WORKERS_AI_CLASSIFIER_MODELS,
+		...OPENAI_CLASSIFIER_MODELS,
 	];
 	for (const model of classifierModels) {
 		providers[model.provider] ??= { chat: {}, image: {}, classifier: {} };
