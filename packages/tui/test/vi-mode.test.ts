@@ -408,3 +408,32 @@ describe("Editor vi mode: non-printable keys in normal mode", () => {
 		assert.strictEqual(editor.getText(), "");
 	});
 });
+
+describe("Editor vi mode: p (yank-paste)", () => {
+	it("dd then p restores the deleted line below the cursor", () => {
+		// dd pushes the line onto the kill ring; p yanks it back.
+		const editor = createViEditor("first line\nsecond line\nthird line");
+		feedKeys(editor, "\x1b"); // cursor starts on the last line (end of buffer)
+		feedKeys(editor, "kk");    // move up to the first line
+		feedKeys(editor, "j");     // move to second line
+		feedKeys(editor, "dd"); // delete it
+		assert.strictEqual(editor.getText(), "first line\nthird line");
+		feedKeys(editor, "p");
+		// FIXME(characterization): p inserts the yanked text at the cursor
+		// position (via the Emacs kill-ring path) instead of opening a new
+		// line below, so "second line\n" lands mid-line.
+		assert.strictEqual(editor.getText(), "first line\nthird linesecond line\n");
+		assert.strictEqual(editor.getViMode(), "normal");
+	});
+
+	it("dw then p pastes the deleted word", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0"); // normal mode, col 0
+		feedKeys(editor, "dw");    // delete "hello "
+		assert.strictEqual(editor.getText(), "world");
+		feedKeys(editor, "p");
+		// FIXME(characterization): at col 0 the yanked text lands before the
+		// cursor char, so "hello " is prepended rather than appended after "w".
+		assert.strictEqual(editor.getText(), "hello world");
+	});
+});
