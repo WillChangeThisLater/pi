@@ -194,10 +194,10 @@ describe("Editor vi mode: word motions", () => {
 		assertState(editor, { cursor: { line: 0, col: 2 } });
 	});
 
-	it("e is not implemented: unknown command is a no-op", () => {
+	it("e moves to the end of the current word", () => {
 		const editor = createViEditor("foo bar");
 		feedKeys(editor, "\x1b0e");
-		assertState(editor, { cursor: { line: 0, col: 0 }, text: "foo bar" });
+		assertState(editor, { cursor: { line: 0, col: 2 }, text: "foo bar" });
 	});
 });
 
@@ -414,8 +414,8 @@ describe("Editor vi mode: p (yank-paste)", () => {
 		// dd pushes the line onto the kill ring; p yanks it back.
 		const editor = createViEditor("first line\nsecond line\nthird line");
 		feedKeys(editor, "\x1b"); // cursor starts on the last line (end of buffer)
-		feedKeys(editor, "kk");    // move up to the first line
-		feedKeys(editor, "j");     // move to second line
+		feedKeys(editor, "kk"); // move up to the first line
+		feedKeys(editor, "j"); // move to second line
 		feedKeys(editor, "dd"); // delete it
 		assert.strictEqual(editor.getText(), "first line\nthird line");
 		feedKeys(editor, "p");
@@ -429,11 +429,333 @@ describe("Editor vi mode: p (yank-paste)", () => {
 	it("dw then p pastes the deleted word", () => {
 		const editor = createViEditor("hello world");
 		feedKeys(editor, "\x1b0"); // normal mode, col 0
-		feedKeys(editor, "dw");    // delete "hello "
+		feedKeys(editor, "dw"); // delete "hello "
 		assert.strictEqual(editor.getText(), "world");
 		feedKeys(editor, "p");
 		// FIXME(characterization): at col 0 the yanked text lands before the
 		// cursor char, so "hello " is prepended rather than appended after "w".
 		assert.strictEqual(editor.getText(), "hello world");
+	});
+});
+
+describe("Editor vi mode: e motion", () => {
+	it("e from the end of a word moves to the next word's end", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b0ee");
+		assertState(editor, { cursor: { line: 0, col: 6 }, text: "foo bar" });
+	});
+
+	it("e on whitespace moves to the end of the next word", () => {
+		const editor = createViEditor("foo  bar");
+		feedKeys(editor, "\x1b03e");
+		assertState(editor, { cursor: { line: 0, col: 7 }, text: "foo  bar" });
+	});
+
+	it("e wraps to the next line", () => {
+		const editor = createViEditor("foo\nbar");
+		feedKeys(editor, "\x1b0ee");
+		assertState(editor, { cursor: { line: 1, col: 2 }, text: "foo\nbar" });
+	});
+
+	it("e at the end of the buffer is a no-op", () => {
+		const editor = createViEditor("foo\nbar");
+		feedKeys(editor, "\x1b");
+		// Cursor starts at line 1, col 3 (== length of "bar").
+		feedKeys(editor, "e");
+		assertState(editor, { cursor: { line: 1, col: 3 }, text: "foo\nbar" });
+	});
+
+	it("de deletes to the end of the word", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b0de");
+		assertState(editor, { text: " bar", cursor: { line: 0, col: 0 } });
+	});
+
+	it("ye yanks to the end of the word and p pastes it", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b0ye");
+		assertState(editor, { text: "foo bar", cursor: { line: 0, col: 0 } });
+		feedKeys(editor, "p");
+		assert.strictEqual(editor.getText(), "foofoo bar");
+	});
+});
+
+describe("Editor vi mode: change operator c", () => {
+	it("cw on a word char acts like ce (does not eat trailing whitespace)", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b0cw");
+		assertState(editor, { text: " bar", cursor: { line: 0, col: 0 }, mode: "insert" });
+	});
+
+	it("cw on whitespace acts like dw", () => {
+		const editor = createViEditor("a  b");
+		feedKeys(editor, "\x1b0lcw");
+		assertState(editor, { text: "ab", cursor: { line: 0, col: 1 }, mode: "insert" });
+	});
+
+	it("cb changes back to the start of the current/previous word", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b$cb");
+		assertState(editor, { text: "foo ", cursor: { line: 0, col: 4 }, mode: "insert" });
+	});
+
+	it("c$ changes to end of line", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0c$");
+		assertState(editor, { text: "", cursor: { line: 0, col: 0 }, mode: "insert" });
+	});
+
+	it("C is equivalent to c$", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0C");
+		assertState(editor, { text: "", cursor: { line: 0, col: 0 }, mode: "insert" });
+	});
+
+	it("c$ at end of line enters insert mode without deleting", () => {
+		const editor = createViEditor("abc");
+		feedKeys(editor, "\x1bc$");
+		assertState(editor, { text: "abc", cursor: { line: 0, col: 3 }, mode: "insert" });
+	});
+
+	it("cc clears the current line and enters insert mode at col 0", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1bcc");
+		assertState(editor, { text: "", cursor: { line: 0, col: 0 }, mode: "insert" });
+	});
+
+	it("cc on a middle line clears only that line (keeps the line itself)", () => {
+		const editor = createViEditor("one\ntwo\nthree");
+		feedKeys(editor, "\x1b0kcc");
+		assertState(editor, { text: "one\n\nthree", cursor: { line: 1, col: 0 }, mode: "insert" });
+	});
+
+	it("cc yanks the cleared line so p can restore it", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1b0cc\x1b");
+		// cc puts us in insert mode; escape back to normal before pasting.
+		feedKeys(editor, "p");
+		// p inserts the yanked "hello\n" at the cursor position (col 0).
+		assert.strictEqual(editor.getText(), "hello\n");
+	});
+
+	it("c with an invalid motion falls through to a fresh command", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b0czl");
+		assertState(editor, { text: "foo bar", cursor: { line: 0, col: 1 }, mode: "normal" });
+	});
+
+	it("change is undoable", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b0cw\x1b");
+		assert.strictEqual(editor.getText(), " bar");
+		feedKeys(editor, "u");
+		assert.strictEqual(editor.getText(), "foo bar");
+	});
+});
+
+describe("Editor vi mode: yank operator y", () => {
+	it("yw yanks to the start of the next word without changing the buffer", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0yw");
+		assertState(editor, { text: "hello world", cursor: { line: 0, col: 0 }, mode: "normal" });
+		feedKeys(editor, "p");
+		assert.strictEqual(editor.getText(), "hello hello world");
+	});
+
+	it("yb yanks back to the start of the word and moves the cursor", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b$yb");
+		assertState(editor, { text: "foo bar", cursor: { line: 0, col: 4 }, mode: "normal" });
+		feedKeys(editor, "p");
+		assert.strictEqual(editor.getText(), "foo barbar");
+	});
+
+	it("y$ yanks to end of line", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0y$p");
+		// p at col 0 prepends the yanked "hello world" (documented quirk).
+		assert.strictEqual(editor.getText(), "hello worldhello world");
+	});
+
+	it("Y is equivalent to y$", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0Yp");
+		assert.strictEqual(editor.getText(), "hello worldhello world");
+	});
+
+	it("yy yanks the current line", () => {
+		const editor = createViEditor("one\ntwo");
+		feedKeys(editor, "\x1bk0yy");
+		assertState(editor, { text: "one\ntwo", cursor: { line: 0, col: 0 }, mode: "normal" });
+		feedKeys(editor, "p");
+		assert.strictEqual(editor.getText(), "one\none\ntwo");
+	});
+
+	it("yy on the only line yanks it", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1b0yyp");
+		assert.strictEqual(editor.getText(), "hello\nhello");
+	});
+});
+
+describe("Editor vi mode: counts", () => {
+	it("3w moves three words forward", () => {
+		const editor = createViEditor("a b c d");
+		feedKeys(editor, "\x1b03w");
+		assertState(editor, { cursor: { line: 0, col: 6 } });
+	});
+
+	it("3w wraps across lines", () => {
+		const editor = createViEditor("ab cd\nef gh");
+		feedKeys(editor, "\x1bk03w");
+		// Steps: -> "cd" (col 3), -> col 5 (== length, the editor's w quirk
+		// rests one past the last word before wrapping), -> line 1 col 0.
+		assertState(editor, { cursor: { line: 1, col: 0 } });
+	});
+
+	it("12j (multi-digit count) moves down 12 lines", () => {
+		const editor = createViEditor("1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12");
+		feedKeys(editor, "\x1bkkkkkkkkkkk");
+		assert.strictEqual(state(editor).cursor.line, 0);
+		feedKeys(editor, "12j");
+		assert.strictEqual(state(editor).cursor.line, 11);
+		assert.strictEqual(editor.getText(), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12");
+	});
+
+	it("0 without a count is motion-to-col-0", () => {
+		const editor = createViEditor("abc");
+		feedKeys(editor, "\x1b$0");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+	});
+
+	it("d3w deletes three words", () => {
+		const editor = createViEditor("one two three four");
+		feedKeys(editor, "\x1b0d3w");
+		assertState(editor, { text: "four", cursor: { line: 0, col: 0 } });
+	});
+
+	it("3dw deletes three words", () => {
+		const editor = createViEditor("one two three four");
+		feedKeys(editor, "\x1b03dw");
+		assertState(editor, { text: "four", cursor: { line: 0, col: 0 } });
+	});
+
+	it("d3w stops at the end of the buffer when there are fewer words", () => {
+		const editor = createViEditor("one two");
+		feedKeys(editor, "\x1b0d3w");
+		assertState(editor, { text: "", cursor: { line: 0, col: 0 } });
+	});
+
+	it("d3w that crosses a line boundary joins correctly", () => {
+		const editor = createViEditor("one two\nthree");
+		feedKeys(editor, "\x1bk0d3w");
+		assertState(editor, { text: "three", cursor: { line: 0, col: 0 } });
+	});
+
+	it("2dd deletes two lines", () => {
+		const editor = createViEditor("one\ntwo\nthree\nfour");
+		feedKeys(editor, "\x1bkkkk02dd");
+		assertState(editor, { text: "three\nfour", cursor: { line: 0, col: 0 } });
+	});
+
+	it("d2d deletes two lines", () => {
+		const editor = createViEditor("one\ntwo\nthree\nfour");
+		feedKeys(editor, "\x1bkkkk0d2d");
+		assertState(editor, { text: "three\nfour", cursor: { line: 0, col: 0 } });
+	});
+
+	it("2yy yanks two lines", () => {
+		const editor = createViEditor("one\ntwo\nthree");
+		feedKeys(editor, "\x1bkkk02yyp");
+		// p at (0,0) inserts the yanked "one\ntwo\n" before the cursor.
+		assert.strictEqual(editor.getText(), "one\ntwo\none\ntwo\nthree");
+	});
+
+	it("c3w changes three words", () => {
+		const editor = createViEditor("one two three four");
+		feedKeys(editor, "\x1b0c3w");
+		assertState(editor, { text: " four", cursor: { line: 0, col: 0 }, mode: "insert" });
+	});
+
+	it("3x deletes three characters", () => {
+		const editor = createViEditor("abcdef");
+		feedKeys(editor, "\x1b03x");
+		assertState(editor, { text: "def", cursor: { line: 0, col: 0 } });
+	});
+
+	it("3l moves three columns right", () => {
+		const editor = createViEditor("abcdef");
+		feedKeys(editor, "\x1b03l");
+		assertState(editor, { cursor: { line: 0, col: 3 } });
+	});
+
+	it("3b moves three words backward", () => {
+		const editor = createViEditor("a b c d");
+		feedKeys(editor, "\x1b$3b");
+		assertState(editor, { cursor: { line: 0, col: 2 } });
+	});
+
+	it("2u performs two undos", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b0dw");
+		assert.strictEqual(editor.getText(), "bar");
+		feedKeys(editor, "2u");
+		// First undo restores "foo bar"; second undo reverts the setText()
+		// snapshot (documented characterization quirk), wiping the buffer.
+		assert.strictEqual(editor.getText(), "");
+	});
+
+	it("count with u on an empty undo stack is a graceful no-op", () => {
+		const editor = createViEditor("foo");
+		feedKeys(editor, "\x1b5u");
+		assertState(editor, { text: "", cursor: { line: 0, col: 0 } });
+	});
+
+	it("a pending count is discarded when a new command follows an invalid operator target", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b2dz");
+		// z is invalid for d: falls through; the fresh `z` is an unknown
+		// no-op command, so nothing happens (cursor stays at the end).
+		assertState(editor, { text: "foo bar", cursor: { line: 0, col: 7 } });
+	});
+
+	it("count is cleared after a completed operator", () => {
+		const editor = createViEditor("one two three");
+		feedKeys(editor, "\x1b02dw");
+		assertState(editor, { text: "three", cursor: { line: 0, col: 0 } });
+		// The stale count must not repeat for the next command.
+		feedKeys(editor, "x");
+		assertState(editor, { text: "hree", cursor: { line: 0, col: 0 } });
+	});
+});
+
+describe("Editor vi mode: cw edge cases (vim-exact)", () => {
+	it("cw with cursor on the last char of a word changes only that char", () => {
+		// The e-motion would jump to the NEXT word's end; cw must stop at the
+		// end of the run the cursor sits in.
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "0");    // col 0
+		feedKeys(editor, "ll");    // col 2, on the last 'o' of "foo"
+		feedKeys(editor, "cw");
+		assert.strictEqual(editor.getText(), "fo bar");
+		assert.strictEqual(editor.getViMode(), "insert");
+		typeAndEscape(editor, "X"); // replace the changed char
+		assert.strictEqual(editor.getText(), "foX bar");
+	});
+
+	it("cw on a one-char word changes only that word", () => {
+		const editor = createViEditor("a b c");
+		feedKeys(editor, "\x1b0cw");
+		assert.strictEqual(editor.getText(), " b c");
+		assert.strictEqual(editor.getViMode(), "insert");
+	});
+
+	it("cw on the very last char of the buffer deletes that char", () => {
+		const editor = createViEditor("abc");
+		feedKeys(editor, "\x1b$"); // last char 'c'
+		feedKeys(editor, "cw");
+		assert.strictEqual(editor.getText(), "ab");
+		assert.strictEqual(editor.getViMode(), "insert");
 	});
 });
