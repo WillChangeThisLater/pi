@@ -46,6 +46,9 @@ export interface ViHost {
 	handleForwardDelete(): void;
 	deleteToEndOfLine(): void;
 	undo(): void;
+	/** Redo the last undone change (ctrl-r). The host owns both stacks and
+	 *  invalidates its redo history on every new edit (see pushUndoSnapshot). */
+	redo(): void;
 	yank(): void;
 	getText(): string;
 	/** Notify the editor that buffer content changed. */
@@ -59,11 +62,22 @@ export interface ViHost {
 	notifyModeChange(mode: ViEditorMode): void;
 }
 
+/**
+ * Pending multi-key command, generalized over Phase 2's plain operator
+ * field: an operator (d/c/y) awaiting a motion or text object, a text
+ * object selector (i/a) awaiting a delimiter, or a prefix key (g, r)
+ * awaiting its completion key.
+ */
+type PendingCommand =
+	| { kind: "operator"; op: "d" | "c" | "y" }
+	| { kind: "textobject"; op: "d" | "c" | "y"; include: boolean }
+	| { kind: "prefix"; key: "g" | "r"; op?: "d" | "c" | "y" };
+
 export class ViController {
 	private readonly host: ViHost;
 	private enabled: boolean;
 	private mode: ViEditorMode = "insert";
-	private pendingCommand: "d" | "c" | "y" | null = null;
+	private pendingCommand: PendingCommand | null = null;
 	/** Count digits typed BEFORE the operator/command (e.g. the 3 in `3dw`). */
 	private operatorPrefixCount = 0;
 	/** Count digits typed BETWEEN an operator and its motion (e.g. the 3 in `d3w`). */
@@ -121,7 +135,29 @@ export class ViController {
 			this.dispatchCommand(printable);
 			return;
 		}
+		// Redo (ctrl-r). Not printable, so it must be intercepted here; counts
+		// typed before it apply (2ctrl-r = two redos).
+		if (matchesKey(data, "ctrl+r")) {
+			const count = this.operatorPrefixCount || 1;
+			this.operatorPrefixCount = 0;
+			this.pendingCommand = null;
+			for (let i = 0; i < count; i++) this.host.redo();
+			return;
+		}
+		// Escape in normal mode only cancels a pending multi-key command;
+		// otherwise it keeps its regular keybinding behavior.
+		if (matchesKey(data, "escape") && this.pendingCommand !== null) {
+			this.cancelPending();
+			return;
+		}
 		this.host.handleRegularInput(data);
+	}
+
+	/** Drop any pending multi-key command and its accumulated counts. */
+	private cancelPending(): void {
+		this.pendingCommand = null;
+		this.operatorPrefixCount = 0;
+		this.operatorCount = 0;
 	}
 
 	/**
@@ -134,25 +170,107 @@ export class ViController {
 	 */
 	private dispatchCommand(key: string): void {
 		const host = this.host;
-		// Resolve a pending operator before dispatching the key itself.
+		// Resolve a pending multi-key command before dispatching the key itself.
 		if (this.pendingCommand !== null) {
 			const pending = this.pendingCommand;
+			if (pending.kind === "textobject") {
+				if (/^[0-9]$/.test(key)) {
+					// Counts between operator and text object are ignored
+					// (`di2"` behaves like `di"`): text objects are
+					// inherently bounded, there is nothing to repeat.
+					return;
+				}
+				this.pendingCommand = null;
+				this.operatorPrefixCount = 0;
+				this.operatorCount = 0;
+				const range = this.textObjectRange(key, pending.include);
+				if (range) {
+					// Inner: exclusive range between the delimiters; whole (`a`):
+					// inclusive range covering both delimiters.
+					this.applyRange(pending.op, range.start, range.end, false, pending.include);
+				} else if (pending.op === "c") {
+					// vim: c with a failed text object still enters insert.
+					this.enterInsertMode();
+				}
+				return;
+			}
+			if (pending.kind === "prefix") {
+				if (pending.key === "g") {
+					if (pending.op === undefined) {
+						// Bare gg/G: digits refine the target line.
+						if (/^[0-9]$/.test(key)) {
+							this.operatorCount = this.operatorCount * 10 + Number(key);
+							return;
+						}
+						if (key === "g") {
+							const count = (this.operatorPrefixCount || 1) * (this.operatorCount || 1);
+							this.cancelPending();
+							this.moveToFirstOrLine(count);
+							return;
+						}
+						// Unknown completion (gj, gT, ...): discard the pending
+						// prefix and treat the key as a fresh command.
+						this.cancelPending();
+						this.dispatchCommand(key);
+						return;
+					}
+					// With a pending operator (dgg/dG family), only `gg` is
+					// valid; `G` completes directly.
+					if (key === "g") {
+						const op = pending.op;
+						const count = (this.operatorPrefixCount || 1) * (this.operatorCount || 1);
+						this.cancelPending();
+						this.applyOperator(op, "gg", count);
+						return;
+					}
+					if (key === "G") {
+						const op = pending.op;
+						const count = (this.operatorPrefixCount || 1) * (this.operatorCount || 1);
+						this.cancelPending();
+						this.applyOperator(op, "G", count);
+						return;
+					}
+					// Invalid completion: discard operator+count, fresh command.
+					this.cancelPending();
+					this.dispatchCommand(key);
+					return;
+				}
+				// pending.key === "r": the replacement char.
+				this.pendingCommand = null;
+				const count = this.operatorPrefixCount || 1;
+				this.operatorPrefixCount = 0;
+				this.replaceChars(key, count);
+				return;
+			}
+			// pending.kind === "operator"
+			const op = pending.op;
 			if (/^[0-9]$/.test(key)) {
 				// Digits between operator and motion are the operator count.
 				// `d0` (with no digits typed yet) is the motion to col 0.
 				if (key === "0" && this.operatorCount === 0) {
 					this.pendingCommand = null;
-					this.applyOperator(pending, "0", this.operatorPrefixCount || 1);
+					this.applyOperator(op, "0", this.operatorPrefixCount || 1);
 				} else {
 					this.operatorCount = this.operatorCount * 10 + Number(key);
 				}
+				return;
+			}
+			// Text objects: i (inner) / a (including delimiters) only make
+			// sense after an operator; bare `i` still enters insert mode.
+			if (key === "i" || key === "a") {
+				this.pendingCommand = { kind: "textobject", op, include: key === "a" };
+				return;
+			}
+			// `g` extends to a gg/G pending prefix (dgg / dG).
+			if (key === "g") {
+				this.pendingCommand = { kind: "prefix", key: "g", op };
 				return;
 			}
 			this.pendingCommand = null;
 			const count = (this.operatorPrefixCount || 1) * (this.operatorCount || 1);
 			this.operatorPrefixCount = 0;
 			this.operatorCount = 0;
-			if (this.tryOperatorWithMotion(pending, key, count)) return;
+			if (this.tryOperatorWithMotion(op, key, count)) return;
 			// Invalid operator target: fall through and treat this key as a
 			// fresh command (the operator and its count are discarded).
 			this.dispatchCommand(key);
@@ -216,6 +334,16 @@ export class ViController {
 				// Repeating undo is sensible: N undos.
 				for (let i = 0; i < count; i++) host.undo();
 				return;
+			case "r":
+				// r{char}: replace char(s); waits for the next key.
+				this.pendingCommand = { kind: "prefix", key: "r" };
+				this.operatorPrefixCount = count;
+				return;
+			case "G": {
+				// G: last line, first non-blank; N G: line N (1-based, clamped).
+				this.moveToFirstOrLine(count === 1 ? Number.MAX_SAFE_INTEGER : count);
+				return;
+			}
 			case "p":
 				// Counts on paste are ignored (kill-ring insert is not repeat-aware).
 				host.yank();
@@ -229,10 +357,16 @@ export class ViController {
 			case "Y":
 				this.applyOperator("y", "$", 1);
 				return;
+			case "g":
+				// gg/G buffer motions: wait for the completion key. The stashed
+				// count refines the target line (5gg = line 5).
+				this.pendingCommand = { kind: "prefix", key: "g" };
+				this.operatorPrefixCount = count;
+				return;
 			case "d":
 			case "c":
 			case "y":
-				this.pendingCommand = key;
+				this.pendingCommand = { kind: "operator", op: key };
 				// operatorPrefixCount was already consumed above as the count
 				// multiplier for this operator; stash it for the resolution.
 				this.operatorPrefixCount = count;
@@ -290,6 +424,9 @@ export class ViController {
 			}
 		}
 		switch (key) {
+			case "G":
+				this.applyOperator(operator, "G", count);
+				return true;
 			case "w":
 				this.applyOperator(operator, "w", count);
 				return true;
@@ -320,7 +457,11 @@ export class ViController {
 	 * The operator-specific tail: d deletes, y yanks to the kill ring without
 	 * mutating, c deletes and enters insert mode.
 	 */
-	private applyOperator(operator: "d" | "c" | "y", motion: "w" | "b" | "e" | "$" | "0", count: number): void {
+	private applyOperator(
+		operator: "d" | "c" | "y",
+		motion: "w" | "b" | "e" | "$" | "0" | "gg" | "G",
+		count: number,
+	): void {
 		// vim special case: `cw` on a non-blank char behaves like `ce` (change
 		// to end of word, do not eat trailing whitespace); on whitespace it is
 		// an ordinary `dw`. With a count, vim repeats the w motion — delegate
@@ -367,6 +508,17 @@ export class ViController {
 			return;
 		}
 
+		// gg/G with an operator are LINEWISE in vim: whole lines from the
+		// cursor's line through the target line are removed/yanked/changed —
+		// not a character range to the target's first-non-blank column.
+		if (motion === "gg" || motion === "G") {
+			const fromLine = this.host.getCursorLine();
+			const from = Math.min(fromLine, target.line);
+			const to = Math.max(fromLine, target.line);
+			this.applyLinewise(operator, from, to);
+			return;
+		}
+
 		const from = { line: this.host.getCursorLine(), col: this.host.getCursorCol() };
 		let start = from;
 		let end = target;
@@ -377,6 +529,37 @@ export class ViController {
 			backward = true;
 		}
 		this.applyRange(operator, start, end, backward, motion === "e");
+	}
+
+	/**
+	 * Line-wise operator application (dd/cc/yy via doubling, and dgg/dG-style
+	 * buffer motions): whole lines [fromLine..toLine] inclusive. The cursor
+	 * rests on the line that follows the removed range, at its first
+	 * non-blank column. `c` additionally enters insert mode.
+	 */
+	private applyLinewise(operator: "d" | "c" | "y", fromLine: number, toLine: number): void {
+		const lines = this.host.getLines();
+		const yanked = lines
+			.slice(fromLine, toLine + 1)
+			.map((l) => `${l}\n`)
+			.join("");
+		if (yanked.length === 0) {
+			if (operator === "c") this.enterInsertMode();
+			return;
+		}
+
+		this.host.exitHistoryBrowsing();
+		this.host.pushUndoSnapshot();
+		this.host.getKillRing().push(yanked, { prepend: false, accumulate: false });
+		this.host.setLastAction("kill");
+		if (operator === "y") return; // yank mutates nothing
+
+		lines.splice(fromLine, toLine - fromLine + 1);
+		if (lines.length === 0) lines.push("");
+		this.host.setCursorLine(Math.min(fromLine, lines.length - 1));
+		this.host.setCursorCol(this.firstNonBlankCol(lines[this.host.getCursorLine()] || ""));
+		this.host.notifyChange();
+		if (operator === "c") this.enterInsertMode();
 	}
 
 	/**
@@ -412,8 +595,12 @@ export class ViController {
 			this.host.setLastAction("kill");
 			this.applyRangeDeletion(start, end, inclusive);
 		}
-		this.host.setCursorLine(backward ? start.line : this.host.getCursorLine());
-		this.host.setCursorCol(backward ? start.col : this.host.getCursorCol());
+		// The cursor rests at the start of the affected region. For forward
+		// word motions start == the original cursor position, so this only
+		// changes anything for text objects whose range begins after the
+		// cursor (e.g. ci" with the cursor on the opening quote).
+		this.host.setCursorLine(start.line);
+		this.host.setCursorCol(start.col);
 		this.host.notifyChange();
 		if (operator === "c") this.enterInsertMode();
 	}
@@ -424,14 +611,26 @@ export class ViController {
 	 * edge); if it can no longer move partway through the count, the last
 	 * reachable position is used.
 	 */
-	private motionTarget(motion: "w" | "b" | "e" | "$" | "0", count: number): { line: number; col: number } | null {
+	private motionTarget(
+		motion: "w" | "b" | "e" | "$" | "0" | "gg" | "G",
+		count: number,
+	): { line: number; col: number } | null {
 		const host = this.host;
+		const lines = host.getLines();
 		let line = host.getCursorLine();
 		let col = host.getCursorCol();
 		switch (motion) {
 			case "$": {
 				const current = host.getLines()[line] || "";
 				return { line, col: current.length };
+			}
+			case "gg":
+			case "G": {
+				// Line targets: first (gg) or last (G), or the count-th line
+				// (1-based, clamped); column = first non-blank (vim semantics).
+				const targetLine =
+					count <= 1 ? (motion === "gg" ? 0 : lines.length - 1) : Math.min(count, lines.length) - 1;
+				return { line: targetLine, col: this.firstNonBlankCol(lines[targetLine] || "") };
 			}
 			case "0":
 				return { line, col: 0 };
@@ -600,6 +799,119 @@ export class ViController {
 		const currentLine = this.host.getLines()[this.host.getCursorLine()] || "";
 		const firstNonBlank = /[^\s]/.exec(currentLine);
 		this.host.setCursorCol(firstNonBlank ? firstNonBlank.index : 0);
+	}
+
+	/** Column of the first non-blank char of `line` (0 for blank/empty lines). */
+	private firstNonBlankCol(line: string): number {
+		const match = /[^\s]/.exec(line);
+		return match ? match.index : 0;
+	}
+
+	/**
+	 * gg (target = first line) and G (target = last line), with an optional
+	 * 1-based line count (clamped to the buffer); the cursor lands on the
+	 * first non-blank char of the target line (vim semantics).
+	 */
+	private moveToFirstOrLine(count: number): void {
+		const lines = this.host.getLines();
+		const targetLine = count === Number.MAX_SAFE_INTEGER ? lines.length - 1 : Math.min(count, lines.length) - 1;
+		this.host.setCursorLine(Math.max(0, targetLine));
+		this.host.setCursorCol(this.firstNonBlankCol(lines[targetLine] || ""));
+	}
+
+	/**
+	 * vi r{char}: replace the chars under the cursor (and to its right) with
+	 * `char`, repeated for the count. Deliberate deviation from vim: when the
+	 * line is shorter than the count, vim fails the whole command while this
+	 * editor replaces what is available (consistent with the clamping model
+	 * used elsewhere). No-op at col == line length or on an empty line; the
+	 * cursor stays on its column; no kill-ring interaction; an undo snapshot
+	 * is pushed before the mutation.
+	 */
+	private replaceChars(char: string, count: number): void {
+		const host = this.host;
+		const line = host.getLines()[host.getCursorLine()] || "";
+		const col = host.getCursorCol();
+		if (col >= line.length) return;
+		const available = Math.min(count, line.length - col);
+		host.exitHistoryBrowsing();
+		host.pushUndoSnapshot();
+		host.getLines()[host.getCursorLine()] = line.slice(0, col) + char.repeat(available) + line.slice(col + available);
+		host.notifyChange();
+	}
+
+	/**
+	 * Resolve a text object key to a same-line range. Returns null when there
+	 * is no enclosing pair on the current line (cursor outside any quotes,
+	 * unbalanced quotes, or no matching bracket): nearest-enclosing-on-line
+	 * semantics, deliberately narrower than vim's cross-line/next-pair
+	 * expansion.
+	 */
+	private textObjectRange(
+		key: string,
+		include: boolean,
+	): { start: { line: number; col: number }; end: { line: number; col: number } } | null {
+		const host = this.host;
+		const line = host.getLines()[host.getCursorLine()] || "";
+		const cursor = host.getCursorCol();
+
+		// Quote objects: " and ' — nearest enclosing pair on the line.
+		if (key === '"' || key === "'") {
+			const positions: number[] = [];
+			for (let i = 0; i < line.length; i++) if (line[i] === key) positions.push(i);
+			// Unbalanced (odd count): the last pair is incomplete — no-op.
+			const pairs: Array<[number, number]> = [];
+			for (let i = 0; i + 1 < positions.length; i += 2) pairs.push([positions[i], positions[i + 1]]);
+			// Enclosing = open <= cursor <= close; innermost = largest open.
+			let best: [number, number] | null = null;
+			for (const [open, close] of pairs) {
+				if (open <= cursor && cursor <= close) best = [open, close];
+			}
+			if (best === null) return null;
+			return this.innerOrWhole(best[0], best[1], include);
+		}
+
+		// Bracket objects: ()/b, {}/B — nearest enclosing pair on the line,
+		// with minimal nesting handling (innermost pair containing cursor).
+		const bracket =
+			key === "(" || key === ")" || key === "b"
+				? { open: "(", close: ")" }
+				: key === "{" || key === "}" || key === "B"
+					? { open: "{", close: "}" }
+					: null;
+		if (bracket === null) return null;
+		const pairs: Array<[number, number]> = [];
+		const openStack: number[] = [];
+		for (let i = 0; i < line.length; i++) {
+			if (line[i] === bracket.open) openStack.push(i);
+			else if (line[i] === bracket.close && openStack.length > 0) pairs.push([openStack.pop() as number, i]);
+		}
+		// Enclosing = open <= cursor <= close (cursor may sit on a delimiter);
+		// innermost = smallest span.
+		let best: [number, number] | null = null;
+		for (const [open, close] of pairs) {
+			if (open <= cursor && cursor <= close && (best === null || close - open < best[1] - best[0])) {
+				best = [open, close];
+			}
+		}
+		if (best === null) return null;
+		return this.innerOrWhole(best[0], best[1], include);
+	}
+
+	/** Range for a text-object pair: inner (between delimiters) or whole (including them). */
+	private innerOrWhole(
+		open: number,
+		close: number,
+		include: boolean,
+	): { start: { line: number; col: number }; end: { line: number; col: number } } {
+		const line = this.host.getCursorLine();
+		if (include) {
+			return { start: { line, col: open }, end: { line, col: close } };
+		}
+		// Inner content: exclusive end at the closing delimiter. For an empty
+		// pair ("" or ()) start == end — applyRange then sees an empty range
+		// (c still enters insert).
+		return { start: { line, col: open + 1 }, end: { line, col: close } };
 	}
 
 	/**

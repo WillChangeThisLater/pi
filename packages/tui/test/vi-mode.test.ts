@@ -735,8 +735,8 @@ describe("Editor vi mode: cw edge cases (vim-exact)", () => {
 		// end of the run the cursor sits in.
 		const editor = createViEditor("foo bar");
 		feedKeys(editor, "\x1b");
-		feedKeys(editor, "0");    // col 0
-		feedKeys(editor, "ll");    // col 2, on the last 'o' of "foo"
+		feedKeys(editor, "0"); // col 0
+		feedKeys(editor, "ll"); // col 2, on the last 'o' of "foo"
 		feedKeys(editor, "cw");
 		assert.strictEqual(editor.getText(), "fo bar");
 		assert.strictEqual(editor.getViMode(), "insert");
@@ -757,5 +757,366 @@ describe("Editor vi mode: cw edge cases (vim-exact)", () => {
 		feedKeys(editor, "cw");
 		assert.strictEqual(editor.getText(), "ab");
 		assert.strictEqual(editor.getViMode(), "insert");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4: redo (ctrl-r), replace char (r), gg/G, text objects
+// ---------------------------------------------------------------------------
+
+describe("Editor vi mode: redo (ctrl-r)", () => {
+	it("ctrl-r redoes the last undone change", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0dw"); // "world"
+		assert.strictEqual(editor.getText(), "world");
+		feedKeys(editor, "u");
+		assert.strictEqual(editor.getText(), "hello world");
+		feedKeys(editor, "\x12"); // ctrl-r
+		assert.strictEqual(editor.getText(), "world");
+	});
+
+	it("ctrl-r restores cursor position captured in the snapshot", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0dww"); // delete "hello", cursor on "world" start (col 0 of new buffer? "world" col 0)
+		const afterEdit = state(editor).cursor;
+		feedKeys(editor, "u\x12");
+		assertState(editor, { text: "world", cursor: afterEdit });
+	});
+
+	it("ctrl-r with empty redo stack is a no-op", () => {
+		const editor = createViEditor("foo");
+		feedKeys(editor, "\x1b\x12");
+		assertState(editor, { text: "foo" });
+	});
+
+	it("a new edit clears the redo stack", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0dw");
+		feedKeys(editor, "u"); // back to "hello world"
+		// New edit: change something.
+		feedKeys(editor, "\x1b0x"); // "ello world" — the new edit clears redo
+		feedKeys(editor, "\x12"); // redo must be a no-op now
+		assert.strictEqual(editor.getText(), "ello world");
+	});
+
+	it("typing in insert mode clears the redo stack", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0dwu");
+		feedKeys(editor, "iX\x1b"); // "Xhello world" — typing clears redo
+		feedKeys(editor, "\x12");
+		assert.strictEqual(editor.getText(), "Xhello world");
+	});
+
+	it("2ctrl-r redoes twice", () => {
+		const editor = createViEditor("aaa bbb ccc");
+		feedKeys(editor, "\x1b0dwdw"); // "ccc"
+		assert.strictEqual(editor.getText(), "ccc");
+		feedKeys(editor, "2u"); // "bbb ccc" then "aaa bbb ccc"
+		assert.strictEqual(editor.getText(), "aaa bbb ccc");
+		feedKeys(editor, "2\x12"); // redo both
+		assert.strictEqual(editor.getText(), "ccc");
+	});
+
+	it("multi-line buffer redo restores all lines", () => {
+		const editor = createViEditor("one\ntwo\nthree");
+		feedKeys(editor, "\x1bggdd"); // delete "one"
+		assert.strictEqual(editor.getText(), "two\nthree");
+		feedKeys(editor, "u");
+		assertState(editor, { text: "one\ntwo\nthree", cursor: { line: 0, col: 0 } });
+		feedKeys(editor, "\x12"); // redo the line deletion
+		assert.strictEqual(editor.getText(), "two\nthree");
+	});
+});
+
+describe("Editor vi mode: replace char (r)", () => {
+	it("r replaces the char under the cursor without a mode change", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1b0rX");
+		assertState(editor, { text: "Xello", mode: "normal", cursor: { line: 0, col: 0 } });
+	});
+
+	it("r keeps the cursor on the same column", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1b0llrZ");
+		assertState(editor, { text: "heZlo", cursor: { line: 0, col: 2 } });
+	});
+
+	it("r at col == line length is a no-op", () => {
+		const editor = createViEditor("abc");
+		feedKeys(editor, "\x1b$rX"); // cursor at col 3 (one past last char)
+		assertState(editor, { text: "abc" });
+	});
+
+	it("r on an empty line is a no-op", () => {
+		const editor = createViEditor("a\n\nb");
+		feedKeys(editor, "\x1bjjrX");
+		assert.strictEqual(editor.getText(), "a\n\nb");
+	});
+
+	it("r pushes an undo snapshot", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1b0rXu");
+		assert.strictEqual(editor.getText(), "hello");
+	});
+
+	it("r does not touch the kill ring", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0rXp"); // p pastes previous kill ring content
+		// No prior kill: p must not insert the replaced char.
+		assert.strictEqual(editor.getText(), "Xello world");
+	});
+
+	it("r followed by escape is a no-op", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1b0r\x1b");
+		assertState(editor, { text: "hello", mode: "normal" });
+	});
+
+	it("3ra replaces three chars with aaa (clamped at line end)", () => {
+		const editor = createViEditor("abcdef");
+		feedKeys(editor, "\x1b0l3ra"); // cols 1..3 -> a|bcd|ef
+		assertState(editor, { text: "aaaaef", cursor: { line: 0, col: 1 } });
+	});
+
+	it("count clamps when fewer chars are available (documented choice)", () => {
+		// vim fails the whole command when the line is too short; this editor
+		// replaces what is there instead (consistent with the clamping model).
+		const editor = createViEditor("ab");
+		feedKeys(editor, "\x1b0l5ra");
+		assert.strictEqual(editor.getText(), "aa");
+	});
+});
+
+describe("Editor vi mode: gg / G buffer motions", () => {
+	it("G moves to the last line, first non-blank", () => {
+		const editor = createViEditor("one\n  two\nthree");
+		feedKeys(editor, "\x1bgg");
+		feedKeys(editor, "G");
+		assertState(editor, { cursor: { line: 2, col: 0 } });
+	});
+
+	it("gg moves to the first line, first non-blank", () => {
+		const editor = createViEditor("one\n  two\n  three");
+		feedKeys(editor, "\x1bG"); // last line
+		feedKeys(editor, "gg");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+	});
+
+	it("gg lands on the first non-blank char", () => {
+		const editor = createViEditor("  indented\nplain");
+		feedKeys(editor, "\x1bGgg");
+		assertState(editor, { cursor: { line: 0, col: 2 } });
+	});
+
+	it("5gg goes to line 5 (1-based)", () => {
+		const editor = createViEditor("1\n2\n3\n4\n5\n6");
+		feedKeys(editor, "\x1bgg5gg");
+		assertState(editor, { cursor: { line: 4, col: 0 } });
+	});
+
+	it("5G goes to line 5", () => {
+		const editor = createViEditor("1\n2\n3\n4\n5\n6");
+		feedKeys(editor, "\x1b5G");
+		assertState(editor, { cursor: { line: 4, col: 0 } });
+	});
+
+	it("gg/G counts clamp to the last line", () => {
+		const editor = createViEditor("1\n2\n3");
+		feedKeys(editor, "\x1b99gg");
+		assertState(editor, { cursor: { line: 2, col: 0 } });
+		feedKeys(editor, "99G");
+		assertState(editor, { cursor: { line: 2, col: 0 } });
+	});
+
+	it("escape cancels a pending g", () => {
+		const editor = createViEditor("one\ntwo");
+		feedKeys(editor, "\x1bG"); // last line
+		feedKeys(editor, "g\x1b"); // pending g cancelled
+		assertState(editor, { cursor: { line: 1, col: 0 } });
+	});
+
+	it("dgg deletes whole lines from cursor back to the first line (linewise)", () => {
+		const editor = createViEditor("one\ntwo\nthree");
+		feedKeys(editor, "\x1bggjdgg"); // cursor to line 1 ("two"), then dgg
+		assert.strictEqual(editor.getText(), "three");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+	});
+
+	it("dG deletes whole lines from cursor to the last line (linewise)", () => {
+		const editor = createViEditor("one\ntwo\nthree");
+		feedKeys(editor, "\x1bggjdG"); // cursor to line 1 ("two"), then dG
+		assert.strictEqual(editor.getText(), "one");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+	});
+});
+
+describe("Editor vi mode: text objects", () => {
+	it('ci" replaces content inside double quotes', () => {
+		const editor = createViEditor('say "hello" now');
+		feedKeys(editor, '\x1b0lllllci"X'); // cursor col 5 (inside)
+		assert.strictEqual(editor.getText(), 'say "X" now');
+		assert.strictEqual(editor.getViMode(), "insert");
+	});
+
+	it('di" deletes content inside double quotes', () => {
+		const editor = createViEditor('say "hello" now');
+		feedKeys(editor, '\x1b0llllldi"');
+		assert.strictEqual(editor.getText(), 'say "" now');
+	});
+
+	it('yi" yanks content inside double quotes', () => {
+		const editor = createViEditor('say "hello" now');
+		feedKeys(editor, '\x1b0lllllyi"p');
+		// p pastes at cursor via kill-ring (characterization quirk).
+		assert.strictEqual(editor.getText(), 'say "hellohello" now');
+	});
+
+	it('ci" works with the cursor on the opening quote', () => {
+		const editor = createViEditor('say "hi"');
+		feedKeys(editor, '\x1b0llllci"X'); // cursor col 4, on the opening quote
+		assert.strictEqual(editor.getText(), 'say "X"');
+	});
+
+	it('ci" with cursor outside any quotes is a no-op (documented choice)', () => {
+		const editor = createViEditor('a "b" c');
+		feedKeys(editor, '\x1b0ci"'); // cursor col 0, outside: no-op
+		assert.strictEqual(editor.getText(), 'a "b" c');
+		// vim parity: c with a failed text object still enters insert mode.
+		assert.strictEqual(editor.getViMode(), "insert");
+	});
+
+	it('ci" with unbalanced quotes on the line is a no-op', () => {
+		const editor = createViEditor('he said "hi');
+		feedKeys(editor, '\x1b0lllllci"');
+		assert.strictEqual(editor.getText(), 'he said "hi'); // buffer unchanged
+	});
+
+	it("ci' works with single quotes", () => {
+		// No apostrophe ambiguity in the surrounding text (the naive quote
+		// pairing treats "it's" as opening a pair).
+		const editor = createViEditor("f 'a b' g");
+		feedKeys(editor, "\x1b0lllllci'X"); // cursor col 5, inside 'a b'
+		assert.strictEqual(editor.getText(), "f 'X' g");
+	});
+
+	it("di( deletes inside parens on the same line", () => {
+		const editor = createViEditor("f(a, b) g");
+		feedKeys(editor, "\x1b0llldi(");
+		assert.strictEqual(editor.getText(), "f() g");
+	});
+
+	it("di) also works (alias for parens)", () => {
+		const editor = createViEditor("f(a, b) g");
+		feedKeys(editor, "\x1b0llldi)");
+		assert.strictEqual(editor.getText(), "f() g");
+	});
+
+	it("dib works (b alias for parens)", () => {
+		const editor = createViEditor("f(x) g");
+		feedKeys(editor, "\x1b0lldib");
+		assert.strictEqual(editor.getText(), "f() g");
+	});
+
+	it("di{ handles nesting on one line (innermost pair)", () => {
+		const editor = createViEditor("a{b{c}d}e");
+		feedKeys(editor, "\x1b0lllldi{"); // cursor on 'c'
+		assert.strictEqual(editor.getText(), "a{b{}d}e");
+	});
+
+	it("diB works (B alias for braces)", () => {
+		const editor = createViEditor("a{bcd}e");
+		feedKeys(editor, "\x1b0llldiB");
+		assert.strictEqual(editor.getText(), "a{}e");
+	});
+
+	it("da( includes the delimiters", () => {
+		const editor = createViEditor("f(x)y");
+		feedKeys(editor, "\x1b0llda(");
+		assert.strictEqual(editor.getText(), "fy");
+	});
+
+	it('da" includes the quotes', () => {
+		const editor = createViEditor('say "hi" ok');
+		feedKeys(editor, '\x1b0lllllda"');
+		assert.strictEqual(editor.getText(), "say  ok");
+	});
+
+	it("ca( includes delimiters and enters insert mode", () => {
+		const editor = createViEditor("f(x)y");
+		feedKeys(editor, "\x1b0lllca(");
+		assert.strictEqual(editor.getViMode(), "insert");
+		typeAndEscape(editor, "Z");
+		assert.strictEqual(editor.getText(), "fZy");
+	});
+
+	it('counts are ignored between operator and text object (di2" = di")', () => {
+		const editor = createViEditor('a "bcd" e');
+		feedKeys(editor, '\x1b0llldi2"');
+		assert.strictEqual(editor.getText(), 'a "" e');
+	});
+
+	it("bare i still enters insert mode", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1bi");
+		assert.strictEqual(editor.getViMode(), "insert");
+	});
+
+	it("text object with no match after operator is a no-op that keeps normal mode", () => {
+		const editor = createViEditor("no quotes here");
+		feedKeys(editor, '\x1b0di"');
+		assert.strictEqual(editor.getViMode(), "normal");
+		assert.strictEqual(editor.getText(), "no quotes here");
+	});
+});
+
+describe("Editor vi mode: Phase 4 verifier coverage gaps", () => {
+	it("u after ctrl-r ping-pongs (undo/redo interplay)", () => {
+		// Guards against redo() failing to re-push the current state onto the
+		// undo stack (that mutation survived the Phase 4 mutation testing).
+		const editor = createViEditor("one two");
+		feedKeys(editor, "\x1b0");
+		feedKeys(editor, "dw"); // "two"
+		assert.strictEqual(editor.getText(), "two");
+		feedKeys(editor, "u"); // undo -> "one two"
+		assert.strictEqual(editor.getText(), "one two");
+		feedKeys(editor, "\x12"); // ctrl-r -> "two"
+		assert.strictEqual(editor.getText(), "two");
+		feedKeys(editor, "u"); // undo the redo -> back to "one two"
+		assert.strictEqual(editor.getText(), "one two");
+		feedKeys(editor, "\x12"); // redo again -> "two"
+		assert.strictEqual(editor.getText(), "two");
+	});
+
+	it("escape cancels a pending r", () => {
+		// Guards the escape branch in handleNormalInput (that mutation
+		// survived: r,esc,l replaced the char instead of being cancelled).
+		const editor = createViEditor("abcd");
+		feedKeys(editor, "\x1b0");
+		feedKeys(editor, "r");
+		feedKeys(editor, "\x1b"); // cancel pending r
+		feedKeys(editor, "l"); // must be a movement, not a replacement
+		assert.strictEqual(editor.getText(), "abcd");
+		assert.strictEqual(editor.getViMode(), "normal");
+		assert.strictEqual(state(editor).cursor.col, 1);
+	});
+
+	it("escape cancels a pending operator (d)", () => {
+		const editor = createViEditor("abcd");
+		feedKeys(editor, "\x1b0");
+		feedKeys(editor, "d");
+		feedKeys(editor, "\x1b"); // cancel pending d
+		feedKeys(editor, "x"); // fresh command: delete one char
+		assert.strictEqual(editor.getText(), "bcd");
+	});
+
+	it("count with operator+gg: 2dgg deletes from buffer start through current line", () => {
+		// Guards the motionTarget gg/G count path (that mutation survived).
+		const editor = createViEditor("l1\nl2\nl3\nl4");
+		feedKeys(editor, "\x1b"); // cursor starts on the last line (end of buffer)
+		feedKeys(editor, "k"); // up to line 3 ("l3", index 2)
+		feedKeys(editor, "2dgg"); // delete from line 3 back through line 2 (linewise)
+		assert.strictEqual(editor.getText(), "l1\nl4");
+		// cursor parks on the line after the deleted range, first non-blank col
+		assertState(editor, { cursor: { line: 1, col: 0 } });
 	});
 });

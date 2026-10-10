@@ -366,8 +366,12 @@ export class Editor implements Component, Focusable {
 	// to.
 	private snappedFromCursorCol: number | null = null;
 
-	// Undo support
+	// Undo support. The redo stack is a sibling of the undo stack; it is
+	// invalidated (cleared) by every pushUndoSnapshot() — the standard editor
+	// semantics "a new edit kills redo" — so it needs no vi-side seam beyond
+	// the redo() host operation.
 	private undoStack = new UndoStack<EditorSnapshot>();
+	private redoStack = new UndoStack<EditorSnapshot>();
 
 	public onSubmit?: (text: string) => void;
 	public onChange?: (text: string) => void;
@@ -420,6 +424,7 @@ export class Editor implements Component, Focusable {
 			handleForwardDelete: () => this.handleForwardDelete(),
 			deleteToEndOfLine: () => this.deleteToEndOfLine(),
 			undo: () => this.undo(),
+			redo: () => this.redo(),
 			yank: () => this.yank(),
 			getText: () => this.getText(),
 			notifyChange: () => {
@@ -759,7 +764,6 @@ export class Editor implements Component, Focusable {
 		if (this.vi.handleInput(data)) return;
 		this.handleRegularInput(data);
 	}
-
 
 	/** Enter insert mode (vi i/a/A/I/o/O target commands call this). */
 	enterViInsertMode(): void {
@@ -2200,13 +2204,35 @@ export class Editor implements Component, Focusable {
 	}
 
 	private pushUndoSnapshot(): void {
+		// Redo invalidation seam: every snapshot push means a new edit, which
+		// must discard the redo history (standard editor semantics).
+		this.redoStack.clear();
 		this.undoStack.push({ state: this.state, pastes: this.pastes, pasteCounter: this.pasteCounter });
+	}
+
+	/** Redo the last undone change (vi ctrl-r): the inverse of undo(). */
+	private redo(): void {
+		this.exitHistoryBrowsing();
+		const snapshot = this.redoStack.pop();
+		if (!snapshot) return;
+		// Re-push the current state so undo/redo can ping-pong.
+		this.undoStack.push({ state: this.state, pastes: this.pastes, pasteCounter: this.pasteCounter });
+		Object.assign(this.state, snapshot.state);
+		this.pastes = snapshot.pastes;
+		this.pasteCounter = snapshot.pasteCounter;
+		this.lastAction = null;
+		this.preferredVisualCol = null;
+		if (this.onChange) {
+			this.onChange(this.getText());
+		}
 	}
 
 	private undo(): void {
 		this.exitHistoryBrowsing();
 		const snapshot = this.undoStack.pop();
 		if (!snapshot) return;
+		// The pre-undo state becomes the redo target.
+		this.redoStack.push({ state: this.state, pastes: this.pastes, pasteCounter: this.pasteCounter });
 		Object.assign(this.state, snapshot.state);
 		this.pastes = snapshot.pastes;
 		this.pasteCounter = snapshot.pasteCounter;
