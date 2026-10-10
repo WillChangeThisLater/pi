@@ -23,6 +23,7 @@ import {
 } from "../utils.ts";
 import { findWordBackward, findWordForward } from "../word-navigation.ts";
 import { SelectList, type SelectListLayoutOptions, type SelectListTheme } from "./select-list.ts";
+import { ViController, type ViEditorMode, type ViHost } from "./vi-mode.ts";
 
 const graphemeSegmenter = getGraphemeSegmenter();
 const wordSegmenter = getWordSegmenter();
@@ -375,11 +376,9 @@ export class Editor implements Component, Focusable {
 	/** Notification callback for insert/normal mode switches. */
 	public onModeChange?: (mode: "insert" | "normal") => void;
 
-	// Vi editing mode (set -o vi style). When enabled, Escape toggles between
-	// insert (default) and normal mode; normal mode interprets vi commands.
-	private viEnabled: boolean = false;
-	private viMode: "insert" | "normal" = "insert";
-	private viPendingCommand: string | null = null;
+	// Vi editing mode (set -o vi style). All vi state and command dispatch
+	// lives in the ViController; the editor only exposes host operations.
+	private readonly vi: ViController;
 
 	constructor(tui: TUI, theme: EditorTheme, options: EditorOptions = {}) {
 		this.tui = tui;
@@ -389,7 +388,52 @@ export class Editor implements Component, Focusable {
 		this.paddingX = Number.isFinite(paddingX) ? Math.max(0, Math.floor(paddingX)) : 0;
 		const maxVisible = options.autocompleteMaxVisible ?? 5;
 		this.autocompleteMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
-		this.viEnabled = options.viMode ?? false;
+		this.vi = new ViController(this.buildViHost(), options.viMode ?? false);
+	}
+
+	/** The narrow seam of editor operations the vi layer may use. */
+	private buildViHost(): ViHost {
+		return {
+			getLines: () => this.state.lines,
+			getCursorLine: () => this.state.cursorLine,
+			setCursorLine: (line) => {
+				this.state.cursorLine = line;
+			},
+			getCursorCol: () => this.state.cursorCol,
+			setCursorCol: (col) => this.setCursorCol(col),
+			moveCursor: (dl, dc) => this.moveCursor(dl, dc),
+			moveToLineStart: () => this.moveToLineStart(),
+			moveToLineEnd: () => this.moveToLineEnd(),
+			isOnFirstVisualLine: () => this.isOnFirstVisualLine(),
+			isOnLastVisualLine: () => this.isOnLastVisualLine(),
+			isEditorEmpty: () => this.isEditorEmpty(),
+			getHistoryIndex: () => this.historyIndex,
+			navigateHistory: (dir) => this.navigateHistory(dir),
+			exitHistoryBrowsing: () => this.exitHistoryBrowsing(),
+			pushUndoSnapshot: () => this.pushUndoSnapshot(),
+			getKillRing: () => this.killRing,
+			getLastAction: () => this.lastAction,
+			setLastAction: (a) => {
+				this.lastAction = a;
+			},
+			handleBackspace: () => this.handleBackspace(),
+			handleForwardDelete: () => this.handleForwardDelete(),
+			deleteToEndOfLine: () => this.deleteToEndOfLine(),
+			undo: () => this.undo(),
+			yank: () => this.yank(),
+			getText: () => this.getText(),
+			notifyChange: () => {
+				if (this.onChange) this.onChange(this.getText());
+			},
+			handleRegularInput: (data) => this.handleRegularInput(data),
+			isShowingAutocomplete: () => this.isShowingAutocomplete(),
+			hasAutocompleteState: () => this.autocompleteState !== null,
+			cancelAutocomplete: () => this.cancelAutocomplete(),
+			notifyModeChange: (mode) => {
+				if (this.onModeChange) this.onModeChange(mode);
+				this.tui.requestRender();
+			},
+		};
 	}
 
 	/** Set of currently valid paste IDs, for marker-aware segmentation. */
@@ -526,7 +570,7 @@ export class Editor implements Component, Focusable {
 
 	protected renderBottomBorder(width: number, hiddenLineCount: number): string {
 		let border = hiddenLineCount > 0 ? createScrollBorder("↓", hiddenLineCount, width) : "─".repeat(width);
-		if (this.viEnabled && this.viMode === "normal" && !this.autocompleteState) {
+		if (this.vi.shouldRenderNormalTag()) {
 			const tag = " NORMAL ";
 			const tagWidth = visibleWidth(tag);
 			if (tagWidth < width) {
@@ -712,370 +756,27 @@ export class Editor implements Component, Focusable {
 	}
 
 	handleInput(data: string): void {
-		if (this.viEnabled) {
-			// Escape in insert mode enters normal mode, unless a completion
-			// menu is open (then Escape cancels it instead).
-			if (this.viMode === "insert" && matchesKey(data, "escape") && !this.isShowingAutocomplete()) {
-				this.enterViNormalMode();
-				return;
-			}
-			// In normal mode only unmodified printable keys are vi commands;
-			// everything else (arrows, ctrl/alt combos, home/end, ...) keeps
-			// its regular keybinding behavior.
-			if (this.viMode === "normal") {
-				this.handleViNormalInput(data);
-				return;
-			}
-		}
+		if (this.vi.handleInput(data)) return;
 		this.handleRegularInput(data);
 	}
 
-	/**
-	 * Handle a key while in vi normal mode.
-	 * Printable keys are treated as vi commands; everything else is forwarded
-	 * to the regular keybinding-based handling (arrows, ctrl+..., home/end,
-	 * enter, etc. keep working exactly as before).
-	 */
-	private handleViNormalInput(data: string): void {
-		const printable = decodePrintableKey(data) ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
-		if (printable !== undefined) {
-			this.handleViCommand(printable);
-			return;
-		}
-		this.handleRegularInput(data);
-	}
-
-	/** Dispatch a single (unmodified) printable key as a vi command. */
-	private handleViCommand(key: string): void {
-		// Resolve a pending operator before dispatching the key itself.
-		if (this.viPendingCommand !== null) {
-			const pending = this.viPendingCommand;
-			this.viPendingCommand = null;
-			if (pending === "d") {
-				switch (key) {
-					case "d":
-						this.viDeleteLine();
-						return;
-					case "w":
-						this.viDeleteWordForward();
-						return;
-					case "b":
-						this.viDeleteWordBackward();
-						return;
-					case "$":
-						this.viDeleteToEndOfLine();
-						return;
-					default:
-						// Invalid operator target: fall through and treat this
-						// key as a fresh command.
-						break;
-				}
-			}
-		}
-
-		switch (key) {
-			// Movement
-			case "h":
-				this.moveCursor(0, -1);
-				return;
-			case "l":
-			case " ":
-				this.moveCursor(0, 1);
-				return;
-			case "j":
-				this.viMoveDown();
-				return;
-			case "k":
-				this.viMoveUp();
-				return;
-			case "w":
-				this.viMoveWordForward();
-				return;
-			case "b":
-				this.viMoveWordBackward();
-				return;
-			case "0":
-				this.setCursorCol(0);
-				return;
-			case "^":
-				this.viMoveToFirstNonBlank();
-				return;
-			case "$":
-				this.moveToLineEnd();
-				return;
-			// Editing
-			case "x":
-				this.viDeleteChar();
-				return;
-			case "X":
-				if (this.state.cursorCol > 0) this.handleBackspace();
-				return;
-			case "u":
-				this.undo();
-				return;
-			case "p":
-				this.yank();
-				return;
-			case "D":
-				this.viDeleteToEndOfLine();
-				return;
-			case "d":
-				this.viPendingCommand = "d";
-				return;
-			// Enter insert mode
-			case "i":
-				this.enterViInsertMode();
-				return;
-			case "a": {
-				const currentLine = this.state.lines[this.state.cursorLine] || "";
-				if (this.state.cursorCol < currentLine.length) this.moveCursor(0, 1);
-				this.enterViInsertMode();
-				return;
-			}
-			case "A":
-				this.moveToLineEnd();
-				this.enterViInsertMode();
-				return;
-			case "I":
-				this.viMoveToFirstNonBlank();
-				this.enterViInsertMode();
-				return;
-			case "o":
-				this.viInsertLineBelow();
-				this.enterViInsertMode();
-				return;
-			case "O":
-				this.viInsertLineAbove();
-				this.enterViInsertMode();
-				return;
-			default:
-				// Unknown command: no-op.
-				return;
-		}
-	}
-
-	private viMoveUp(): void {
-		if (
-			this.isOnFirstVisualLine() &&
-			(this.isEditorEmpty() || this.historyIndex > -1 || this.state.cursorCol === 0)
-		) {
-			this.navigateHistory(-1);
-		} else if (this.isOnFirstVisualLine()) {
-			this.moveToLineStart();
-		} else {
-			this.moveCursor(-1, 0);
-		}
-	}
-
-	private viMoveDown(): void {
-		if (this.historyIndex > -1 && this.isOnLastVisualLine()) {
-			this.navigateHistory(1);
-		} else if (this.isOnLastVisualLine()) {
-			this.moveToLineEnd();
-		} else {
-			this.moveCursor(1, 0);
-		}
-	}
-
-	private viMoveToFirstNonBlank(): void {
-		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		const firstNonBlank = /[^\s]/.exec(currentLine);
-		this.setCursorCol(firstNonBlank ? firstNonBlank.index : 0);
-	}
-
-	/**
-	 * vim w: position of the first char of the next word (word = run of word
-	 * chars, punctuation counts as a word of its own).
-	 */
-	private viWordForward(col: number, line: string): number {
-		let i = col;
-		const len = line.length;
-		while (i < len && isWhitespaceChar(line[i])) i++;
-		if (i < len) {
-			const isWord = /\w/.test(line[i]);
-			if (isWord) {
-				while (i < len && /\w/.test(line[i])) i++;
-			} else {
-				while (i < len && !isWhitespaceChar(line[i])) i++;
-			}
-		}
-		while (i < len && isWhitespaceChar(line[i])) i++;
-		return i;
-	}
-
-	/**
-	 * vim b: position of the start of the current/previous word.
-	 */
-	private viWordBackward(col: number, line: string): number {
-		let i = col;
-		while (i > 0 && isWhitespaceChar(line[i - 1])) i--;
-		if (i > 0) {
-			const isWord = /\w/.test(line[i - 1]);
-			if (isWord) {
-				while (i > 0 && /\w/.test(line[i - 1])) i--;
-			} else {
-				while (i > 0 && !isWhitespaceChar(line[i - 1])) i--;
-			}
-		}
-		return i;
-	}
-
-	/** vi w: move to the start of the next word (wraps to next line at EOL). */
-	private viMoveWordForward(): void {
-		const line = this.state.lines[this.state.cursorLine] || "";
-		const next = this.viWordForward(this.state.cursorCol, line);
-		if (next > this.state.cursorCol) {
-			this.setCursorCol(next);
-			return;
-		}
-		if (this.state.cursorLine < this.state.lines.length - 1) {
-			this.state.cursorLine++;
-			this.setCursorCol(0);
-		}
-	}
-
-	/** vi b: move to the start of the current/previous word (wraps to previous line at col 0). */
-	private viMoveWordBackward(): void {
-		const line = this.state.lines[this.state.cursorLine] || "";
-		const prev = this.viWordBackward(this.state.cursorCol, line);
-		if (prev < this.state.cursorCol) {
-			this.setCursorCol(prev);
-			return;
-		}
-		if (this.state.cursorLine > 0) {
-			this.state.cursorLine--;
-			const prevLine = this.state.lines[this.state.cursorLine] || "";
-			this.setCursorCol(prevLine.length);
-		}
-	}
-
-	/** vi dw: delete to the start of the next word, joining the next line at EOL. */
-	private viDeleteWordForward(): void {
-		this.exitHistoryBrowsing();
-		const line = this.state.lines[this.state.cursorLine] || "";
-		const target = this.viWordForward(this.state.cursorCol, line);
-		if (target > this.state.cursorCol) {
-			this.pushUndoSnapshot();
-			this.killRing.push(line.slice(this.state.cursorCol, target), {
-				prepend: false,
-				accumulate: this.lastAction === "kill",
-			});
-			this.lastAction = "kill";
-			this.state.lines[this.state.cursorLine] = line.slice(0, this.state.cursorCol) + line.slice(target);
-			this.setCursorCol(this.state.cursorCol);
-			if (this.onChange) this.onChange(this.getText());
-			return;
-		}
-		if (this.state.cursorLine < this.state.lines.length - 1) {
-			this.pushUndoSnapshot();
-			const nextLine = this.state.lines[this.state.cursorLine + 1] || "";
-			this.killRing.push("\n", { prepend: false, accumulate: this.lastAction === "kill" });
-			this.lastAction = "kill";
-			this.state.lines[this.state.cursorLine] = line + nextLine;
-			this.state.lines.splice(this.state.cursorLine + 1, 1);
-			if (this.onChange) this.onChange(this.getText());
-		}
-	}
-
-	/** vi db: delete back to the start of the current/previous word. */
-	private viDeleteWordBackward(): void {
-		this.exitHistoryBrowsing();
-		const line = this.state.lines[this.state.cursorLine] || "";
-		const target = this.viWordBackward(this.state.cursorCol, line);
-		if (target < this.state.cursorCol) {
-			this.pushUndoSnapshot();
-			this.killRing.push(line.slice(target, this.state.cursorCol), {
-				prepend: true,
-				accumulate: this.lastAction === "kill",
-			});
-			this.lastAction = "kill";
-			this.state.lines[this.state.cursorLine] = line.slice(0, target) + line.slice(this.state.cursorCol);
-			this.setCursorCol(target);
-			if (this.onChange) this.onChange(this.getText());
-		}
-	}
-
-	/** vi x: delete the character under the cursor (no-op at end of line). */
-	private viDeleteChar(): void {
-		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		if (this.state.cursorCol < currentLine.length) {
-			this.handleForwardDelete();
-		}
-	}
-
-	/** vi D / d$: delete to end of line (no-op at end of line). */
-	private viDeleteToEndOfLine(): void {
-		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		if (this.state.cursorCol < currentLine.length) {
-			this.deleteToEndOfLine();
-		}
-	}
-
-	/** vi dd: delete the current line, keeping the last line intact. */
-	private viDeleteLine(): void {
-		this.exitHistoryBrowsing();
-		this.pushUndoSnapshot();
-		const currentLine = this.state.lines[this.state.cursorLine] || "";
-		this.killRing.push(`${currentLine}\n`, { prepend: false, accumulate: false });
-		this.lastAction = "kill";
-		if (this.state.lines.length === 1) {
-			this.state.lines[0] = "";
-			this.state.cursorLine = 0;
-			this.setCursorCol(0);
-		} else {
-			this.state.lines.splice(this.state.cursorLine, 1);
-			this.state.cursorLine = Math.min(this.state.cursorLine, this.state.lines.length - 1);
-			const line = this.state.lines[this.state.cursorLine] || "";
-			this.setCursorCol(Math.min(this.state.cursorCol, line.length));
-		}
-		if (this.onChange) this.onChange(this.getText());
-	}
-
-	private viInsertLineBelow(): void {
-		this.exitHistoryBrowsing();
-		this.pushUndoSnapshot();
-		const insertIndex = this.state.cursorLine + 1;
-		this.state.lines.splice(insertIndex, 0, "");
-		this.state.cursorLine = insertIndex;
-		this.setCursorCol(0);
-		if (this.onChange) this.onChange(this.getText());
-	}
-
-	private viInsertLineAbove(): void {
-		this.exitHistoryBrowsing();
-		this.pushUndoSnapshot();
-		const insertIndex = this.state.cursorLine;
-		this.state.lines.splice(insertIndex, 0, "");
-		this.state.cursorLine = insertIndex;
-		this.setCursorCol(0);
-		if (this.onChange) this.onChange(this.getText());
-	}
 
 	/** Enter insert mode (vi i/a/A/I/o/O target commands call this). */
 	enterViInsertMode(): void {
-		if (!this.viEnabled || this.viMode === "insert") return;
-		this.viMode = "insert";
-		if (this.onModeChange) this.onModeChange(this.viMode);
-		this.tui.requestRender();
+		this.vi.enterInsertMode();
 	}
 
 	/** Enter normal mode, cancelling any completion menu and pending operator. */
 	enterViNormalMode(): void {
-		if (!this.viEnabled || this.viMode === "normal") return;
-		this.viMode = "normal";
-		this.viPendingCommand = null;
-		this.cancelAutocomplete();
-		this.exitHistoryBrowsing();
-		if (this.onModeChange) this.onModeChange(this.viMode);
-		this.tui.requestRender();
+		this.vi.enterNormalMode();
 	}
 
 	isViModeEnabled(): boolean {
-		return this.viEnabled;
+		return this.vi.isEnabled();
 	}
 
-	getViMode(): "insert" | "normal" {
-		return this.viMode;
+	getViMode(): ViEditorMode {
+		return this.vi.getMode();
 	}
 
 	handleRegularInput(data: string): void {
