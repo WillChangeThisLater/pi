@@ -1,6 +1,6 @@
 import { decodePrintableKey, matchesKey } from "../keys.ts";
 import type { KillRing } from "../kill-ring.ts";
-import { isWhitespaceChar } from "../utils.ts";
+import { getGraphemeSegmenter, isWhitespaceChar } from "../utils.ts";
 
 /**
  * Self-contained vi (set -o vi style) layer for the Editor.
@@ -908,10 +908,28 @@ export class ViController {
 		const line = host.getLines()[host.getCursorLine()] || "";
 		const col = host.getCursorCol();
 		if (col >= line.length) return;
-		const available = Math.min(count, line.length - col);
+		// Grapheme-aware: replace whole grapheme clusters, never individual UTF-16
+		// code units (surrogate-pair emoji, flag sequences, combining accents).
+		// This matches the units the editor's `x`/backspace/delete paths operate on.
+		// Segment the whole line so a col that lands mid-grapheme is snapped to
+		// the start of the grapheme containing it (never splits a cluster).
+		const graphemes = [...getGraphemeSegmenter().segment(line)];
+		let start = -1;
+		let replacedLen = 0;
+		let n = 0;
+		for (const g of graphemes) {
+			if (g.index + g.segment.length <= col) continue;
+			if (start === -1) start = g.index;
+			if (n >= count) break;
+			replacedLen += g.segment.length;
+			n++;
+		}
+		if (start === -1 || n === 0) return;
+		const available = n;
 		host.exitHistoryBrowsing();
 		host.pushUndoSnapshot();
-		host.getLines()[host.getCursorLine()] = line.slice(0, col) + char.repeat(available) + line.slice(col + available);
+		host.getLines()[host.getCursorLine()] =
+			line.slice(0, start) + char.repeat(available) + line.slice(start + replacedLen);
 		host.notifyChange();
 	}
 

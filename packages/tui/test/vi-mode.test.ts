@@ -885,6 +885,61 @@ describe("Editor vi mode: replace char (r)", () => {
 		feedKeys(editor, "\x1b0l5ra");
 		assert.strictEqual(editor.getText(), "aa");
 	});
+
+	it("r replaces a surrogate-pair emoji as one grapheme", () => {
+		const editor = createViEditor("ab\n\u{1F600}ab");
+		// `l` is grapheme-aware, so reach the emoji with 0 (col 0) directly.
+		feedKeys(editor, "\x1bj0rz");
+		assertState(editor, { text: "ab\nzab", cursor: { line: 1, col: 0 } });
+	});
+
+	it("r replaces a flag sequence as one grapheme", () => {
+		const editor = createViEditor("\u{1F1FA}\u{1F1F8}ab");
+		feedKeys(editor, "\x1b0rz");
+		assertState(editor, { text: "zab", cursor: { line: 0, col: 0 } });
+	});
+
+	it("r replaces a skin-tone emoji as one grapheme", () => {
+		const editor = createViEditor("\u{1F44B}\u{1F3FD}ab");
+		feedKeys(editor, "\x1b0rz");
+		assertState(editor, { text: "zab" });
+	});
+
+	it("r replaces a decomposed accent (e + combining acute) as one grapheme", () => {
+		const editor = createViEditor("e\u0301ab");
+		feedKeys(editor, "\x1b0rz");
+		assertState(editor, { text: "zab" });
+	});
+
+	it("r replaces a CJK character (single code unit) with the literal char", () => {
+		const editor = createViEditor("\u4E2Dab");
+		feedKeys(editor, "\x1b0rz");
+		assertState(editor, { text: "zab" });
+	});
+
+	it("2rz on an emoji replaces 2 graphemes without eating the next letter", () => {
+		const editor = createViEditor("\u{1F600}ab");
+		feedKeys(editor, "\x1b02rz");
+		assertState(editor, { text: "zzb", cursor: { line: 0, col: 0 } });
+	});
+
+	it("2rz on flag sequences replaces 2 graphemes", () => {
+		const editor = createViEditor("\u{1F1FA}\u{1F1F8}\u{1F1EB}\u{1F1F7}ab");
+		feedKeys(editor, "\x1b02rz");
+		assertState(editor, { text: "zzab" });
+	});
+
+	it("counted replace clamps at grapheme boundary at line end", () => {
+		const editor = createViEditor("\u{1F600}");
+		feedKeys(editor, "\x1b05rz");
+		assertState(editor, { text: "z" });
+	});
+
+	it("counted grapheme replace is one undo step", () => {
+		const editor = createViEditor("\u{1F600}ab");
+		feedKeys(editor, "\x1b02rzu");
+		assert.strictEqual(editor.getText(), "\u{1F600}ab");
+	});
 });
 
 describe("Editor vi mode: gg / G buffer motions", () => {
