@@ -178,6 +178,15 @@ export class ViController {
 		// everything else (arrows, ctrl/alt combos, home/end, ...) keeps
 		// its regular keybinding behavior.
 		if (this.mode === "normal") {
+			// A chunk with an EMBEDDED terminal sequence (e.g. printable text
+			// around a paste marker \x1b[200~) must not be split per-char: the
+			// sequence bytes would be misread as vi commands and can wipe the
+			// buffer. The editor's regular path understands paste markers and
+			// multi-char chunks — forward the whole chunk there.
+			if (data.length > 1 && data.includes("\x1b[")) {
+				this.host.handleRegularInput(data);
+				return true;
+			}
 			this.handleNormalInput(data);
 			return true;
 		}

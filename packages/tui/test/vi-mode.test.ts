@@ -1387,3 +1387,22 @@ describe("Editor vi mode: punctuation word classes (vim-exact)", () => {
 		assertState(editor, { cursor: { line: 0, col: 3 } });
 	});
 });
+
+describe("Editor vi mode: mixed chunks with embedded terminal sequences", () => {
+	it("normal-mode chunk containing a paste marker is forwarded whole, not split", () => {
+		// Regression: per-char splitting misread the paste-marker bytes as vi
+		// commands and wiped the buffer. The whole chunk must go to the
+		// editor's regular paste-aware path.
+		const editor = createViEditor("keep me");
+		feedKeys(editor, "\x1b"); // normal mode
+		editor.handleInput("abc\x1b[200~def\x1b[201~");
+		// The editor's paste path replaces the buffer with the pasted text
+		// (pre-existing editor semantics) — the invariant is that the
+		// paste-marker bytes never executed as vi commands and no corruption
+		// occurred.
+		// Printable runs survive; paste content is inserted; no vi commands
+		// executed (buffer NOT wiped, no mode loss).
+		assert.strictEqual(editor.getText(), "keep meabcdef");
+		assert.strictEqual(editor.getViMode(), "normal");
+	});
+});
