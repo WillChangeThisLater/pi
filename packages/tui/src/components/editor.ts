@@ -422,6 +422,9 @@ export class Editor implements Component, Focusable {
 			},
 			handleBackspace: () => this.handleBackspace(),
 			handleForwardDelete: () => this.handleForwardDelete(),
+			moveCursorGraphemes: (count, direction) => this.moveCursorGraphemes(count, direction),
+			deleteGraphemesForward: (count) => this.deleteGraphemesForward(count),
+			deleteGraphemesBackward: (count) => this.deleteGraphemesBackward(count),
 			deleteToEndOfLine: () => this.deleteToEndOfLine(),
 			undo: () => this.undo(),
 			redo: () => this.redo(),
@@ -439,6 +442,142 @@ export class Editor implements Component, Focusable {
 				this.tui.requestRender();
 			},
 		};
+	}
+
+	/**
+	 * Batched single-grapheme horizontal movement, semantically identical to
+	 * calling moveCursor(0, direction) `count` times, but in one pass: each
+	 * moveCursor(0,±1) rebuilds the visual line map and re-segments the line,
+	 * which is O(count × line) for vi count loops on long lines. Stops when a
+	 * step would not move the cursor (buffer edge). Used only by the vi host
+	 * adapter above.
+	 */
+	private moveCursorGraphemes(count: number, direction: 1 | -1): void {
+		this.lastAction = null;
+		let moved = 0;
+		while (moved < count) {
+			const line = this.state.lines[this.state.cursorLine] || "";
+			if (direction > 0) {
+				if (this.state.cursorCol < line.length) {
+					// Walk the remaining grapheme clusters forward in one pass.
+					const graphemes = [...this.segment(line.slice(this.state.cursorCol), "grapheme")];
+					let steps = 0;
+					let col = this.state.cursorCol;
+					for (const g of graphemes) {
+						if (steps >= count - moved) break;
+						col += g.segment.length;
+						steps++;
+					}
+					this.setCursorCol(col);
+					moved += steps;
+				} else if (this.state.cursorLine < this.state.lines.length - 1) {
+					// Wrap to the start of the next logical line (one step).
+					this.state.cursorLine++;
+					this.setCursorCol(0);
+					moved++;
+				} else {
+					// Parked at end of last line: replicate moveCursor's sticky
+					// column bookkeeping, then stop (no movement).
+					const visualLines = this.buildVisualLineMap(this.lastWidth);
+					const currentVL = visualLines[this.findCurrentVisualLine(visualLines)];
+					if (currentVL) {
+						this.preferredVisualCol = this.state.cursorCol - currentVL.startCol;
+					}
+					break;
+				}
+			} else {
+				if (this.state.cursorCol > 0) {
+					// Walk `count - moved` grapheme clusters backward in one pass.
+					const graphemes = [...this.segment(line.slice(0, this.state.cursorCol), "grapheme")];
+					let steps = 0;
+					let col = this.state.cursorCol;
+					for (let i = graphemes.length - 1; i >= 0 && steps < count - moved; i--, steps++) {
+						col -= graphemes[i].segment.length;
+					}
+					this.setCursorCol(col);
+					moved += steps;
+				} else if (this.state.cursorLine > 0) {
+					// Wrap to the end of the previous logical line (one step).
+					this.state.cursorLine--;
+					const prevLine = this.state.lines[this.state.cursorLine] || "";
+					this.setCursorCol(prevLine.length);
+					moved++;
+				} else {
+					break;
+				}
+			}
+		}
+	}
+
+	/**
+	 * Batched vi x: delete up to `count` graphemes at/after the cursor on the
+	 * current line with a single undo snapshot. No-op at col == line length.
+	 * Does not wrap lines (vi x never does). Used only by the vi host adapter.
+	 */
+	private deleteGraphemesForward(count: number): void {
+		const currentLine = this.state.lines[this.state.cursorLine] || "";
+		if (this.state.cursorCol >= currentLine.length) return;
+		this.exitHistoryBrowsing();
+		this.lastAction = null;
+		this.pushUndoSnapshot();
+		const graphemes = [...this.segment(currentLine.slice(this.state.cursorCol), "grapheme")];
+		let end = this.state.cursorCol;
+		let removed = 0;
+		for (const g of graphemes) {
+			if (removed >= count) break;
+			end += g.segment.length;
+			removed++;
+		}
+		this.state.lines[this.state.cursorLine] = currentLine.slice(0, this.state.cursorCol) + currentLine.slice(end);
+		this.afterTextEdit();
+	}
+
+	/**
+	 * Batched vi X: delete up to `count` graphemes before the cursor on the
+	 * current line with a single undo snapshot. Stops at col 0. Paste markers
+	 * need handleBackspace's renumbering side effects, so fall back to the
+	 * per-character path when one is present. Used only by the vi adapter.
+	 */
+	private deleteGraphemesBackward(count: number): void {
+		const line = this.state.lines[this.state.cursorLine] || "";
+		const col = this.state.cursorCol;
+		if (col === 0) return;
+		this.exitHistoryBrowsing();
+		this.lastAction = null;
+		const beforeCursor = line.slice(0, col);
+		if (PASTE_MARKER_SINGLE.test(beforeCursor)) {
+			for (let i = 0; i < count && this.state.cursorCol > 0; i++) this.handleBackspace();
+			return;
+		}
+		this.pushUndoSnapshot();
+		const graphemes = [...this.segment(beforeCursor, "grapheme")];
+		let start = col;
+		let removed = 0;
+		for (let i = graphemes.length - 1; i >= 0 && removed < count; i--, removed++) {
+			start -= graphemes[i].segment.length;
+		}
+		this.state.lines[this.state.cursorLine] = line.slice(0, start) + line.slice(col);
+		this.setCursorCol(start);
+		this.afterTextEdit();
+	}
+
+	/** Shared post-edit tail of handleForwardDelete/handleBackspace and the
+	 *  batched vi deletions above: notify change and refresh autocomplete. */
+	private afterTextEdit(): void {
+		if (this.onChange) {
+			this.onChange(this.getText());
+		}
+		if (this.autocompleteState) {
+			this.updateAutocomplete();
+		} else {
+			const currentLine = this.state.lines[this.state.cursorLine] || "";
+			const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
+			if (this.isInSlashCommandContext(textBeforeCursor)) {
+				this.tryTriggerAutocomplete();
+			} else if (this.autocompleteTriggerPattern.test(textBeforeCursor)) {
+				this.tryTriggerAutocomplete();
+			}
+		}
 	}
 
 	/** Set of currently valid paste IDs, for marker-aware segmentation. */

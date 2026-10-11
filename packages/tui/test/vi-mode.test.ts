@@ -1120,3 +1120,109 @@ describe("Editor vi mode: Phase 4 verifier coverage gaps", () => {
 		assertState(editor, { cursor: { line: 1, col: 0 } });
 	});
 });
+
+describe("Editor vi mode: count/hang hardening", () => {
+	it("huge count on clamped motion terminates instantly and lands clamped (9999999j)", () => {
+		const editor = createViEditor("a\nb\nc\nd");
+		feedKeys(editor, "\x1bgg");
+		feedKeys(editor, "9999999j");
+		// Cursor must sit on the last line (clamped), not hang. The final j on
+		// the last visual line parks the cursor at line end (col == len).
+		assertState(editor, { cursor: { line: 3, col: 1 } });
+	});
+
+	it("huge count on clamped motion terminates instantly and lands clamped (999999l)", () => {
+		const editor = createViEditor("short line");
+		feedKeys(editor, "\x1b0");
+		feedKeys(editor, "999999l");
+		assertState(editor, { cursor: { line: 0, col: 10 } });
+	});
+
+	it("huge count on clamped motions h/k terminates and lands clamped", () => {
+		const editor = createViEditor("a\nb\nc\nd");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "999999999k");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+		feedKeys(editor, "999999999h");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+	});
+
+	it("huge count on x terminates and deletes only to end of line", () => {
+		const editor = createViEditor("abc");
+		feedKeys(editor, "\x1b0");
+		feedKeys(editor, "999999999x");
+		assert.strictEqual(editor.getText(), "");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+	});
+
+	it("huge count on X terminates and deletes only to start of line", () => {
+		const editor = createViEditor("abc");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "999999999X");
+		assert.strictEqual(editor.getText(), "");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+	});
+
+	it("huge count on w/b/e terminates and lands at buffer edge", () => {
+		const editor = createViEditor("one two three");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "999999999w");
+		assertState(editor, { cursor: { line: 0, col: 13 } });
+		feedKeys(editor, "999999999b");
+		assertState(editor, { cursor: { line: 0, col: 0 } });
+		feedKeys(editor, "999999999e");
+		// last word end: 'e' of "three" at col 12
+		assertState(editor, { cursor: { line: 0, col: 12 } });
+	});
+
+	it("huge count on u terminates without hanging once the undo stack is exhausted", () => {
+		const editor = createViEditor();
+		feedKeys(editor, "hello\x1b");
+		// Every undoable change is reverted, then the loop must stop.
+		feedKeys(editor, "999999999u");
+		assert.strictEqual(editor.getText(), "");
+	});
+
+	it("escape clears a bare count: 3<esc>dd deletes one line", () => {
+		const editor = createViEditor("l1\nl2\nl3");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "3");
+		feedKeys(editor, "\x1b");
+		// cursor is on the last line; a plain dd deletes exactly that line
+		feedKeys(editor, "dd");
+		assert.strictEqual(editor.getText(), "l1\nl2");
+	});
+
+	it("escape clears a huge bare count so it cannot hang later commands", () => {
+		const editor = createViEditor("abc");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "99999999999");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "0x");
+		// Count was discarded: exactly one char deleted from col 0.
+		assert.strictEqual(editor.getText(), "bc");
+	});
+
+	it("escape clears a count attached to a pending operator: 3d<esc>dd", () => {
+		const editor = createViEditor("l1\nl2\nl3");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "3d");
+		feedKeys(editor, "\x1b");
+		feedKeys(editor, "dd");
+		assert.strictEqual(editor.getText(), "l1\nl2");
+	});
+
+	it("counts are capped at VI_MAX_COUNT: huge digit runs still complete instantly", () => {
+		const editor = createViEditor("a\nb\nc\nd");
+		feedKeys(editor, "\x1bgg");
+		feedKeys(editor, "99999999999999999999j");
+		assertState(editor, { cursor: { line: 3, col: 1 } });
+	});
+
+	it("count cap does not affect normal counts: 2j moves 2 lines", () => {
+		const editor = createViEditor("l1\nl2\nl3\nl4");
+		feedKeys(editor, "\x1bgg");
+		feedKeys(editor, "2j");
+		assertState(editor, { cursor: { line: 2, col: 0 } });
+	});
+});

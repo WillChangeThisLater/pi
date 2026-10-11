@@ -14,6 +14,20 @@ import { isWhitespaceChar } from "../utils.ts";
 
 export type ViEditorMode = "insert" | "normal";
 
+/**
+ * Upper bound for accumulated vi counts. Real vi usage never exceeds three
+ * digits; the cap exists so an absurd count (`999999999j`) cannot drive a
+ * multi-second loop through the editor. Loop commands additionally early-exit
+ * when an iteration stops making progress, so correctness does not depend on
+ * this cap — it only guards commands that cannot detect stagnation.
+ */
+export const VI_MAX_COUNT = 10000;
+
+/** Clamp an accumulating count to [VI_MAX_COUNT] (sticky at the cap). */
+function clampCount(count: number, digit: number): number {
+	return Math.min(count * 10 + digit, VI_MAX_COUNT);
+}
+
 /** The subset of Editor internals a vi command may use. */
 export interface ViHost {
 	/** Live line array of the editor buffer (mutations are visible to the editor). */
@@ -28,6 +42,14 @@ export interface ViHost {
 	setCursorCol(col: number): void;
 	/** Move the cursor by deltas (editor clamping applies). */
 	moveCursor(deltaLine: number, deltaCol: number): void;
+	/**
+	 * Batched horizontal move: semantically identical to calling
+	 * moveCursor(0, direction) `count` times, but implemented in one pass so
+	 * vi count loops stay O(line) instead of O(count × line) (each
+	 * moveCursor(0,±1) rebuilds the visual line map and re-segments the
+	 * line). Stops early when a step would not move the cursor.
+	 */
+	moveCursorGraphemes(count: number, direction: 1 | -1): void;
 	moveToLineStart(): void;
 	moveToLineEnd(): void;
 	isOnFirstVisualLine(): boolean;
@@ -44,6 +66,20 @@ export interface ViHost {
 	setLastAction(action: "kill" | "yank" | "type-word" | null): void;
 	handleBackspace(): void;
 	handleForwardDelete(): void;
+	/**
+	 * Batched vi x: delete up to `count` graphemes at/after the cursor on the
+	 * current line (no line wrap, no-op at col == line length), with a single
+	 * undo snapshot for the whole batch — semantically the composition of
+	 * `count` handleForwardDelete() calls, minus the per-call O(line) cost.
+	 */
+	deleteGraphemesForward(count: number): void;
+	/**
+	 * Batched vi X: delete up to `count` graphemes before the cursor on the
+	 * current line (stops at col 0), single undo snapshot. Semantically the
+	 * composition of `count` handleBackspace() calls restricted to the
+	 * within-line branch.
+	 */
+	deleteGraphemesBackward(count: number): void;
 	deleteToEndOfLine(): void;
 	undo(): void;
 	/** Redo the last undone change (ctrl-r). The host owns both stacks and
@@ -144,9 +180,14 @@ export class ViController {
 			for (let i = 0; i < count; i++) this.host.redo();
 			return;
 		}
-		// Escape in normal mode only cancels a pending multi-key command;
-		// otherwise it keeps its regular keybinding behavior.
-		if (matchesKey(data, "escape") && this.pendingCommand !== null) {
+		// Escape in normal mode cancels any pending multi-key command AND any
+		// accumulated count (bare or attached to a pending command) — vim
+		// discards the count on escape (`3<esc>dd` deletes one line). Only when
+		// there is nothing pending does escape keep its regular keybinding.
+		if (
+			matchesKey(data, "escape") &&
+			(this.pendingCommand !== null || this.operatorPrefixCount > 0 || this.operatorCount > 0)
+		) {
 			this.cancelPending();
 			return;
 		}
@@ -199,7 +240,7 @@ export class ViController {
 					if (pending.op === undefined) {
 						// Bare gg/G: digits refine the target line.
 						if (/^[0-9]$/.test(key)) {
-							this.operatorCount = this.operatorCount * 10 + Number(key);
+							this.operatorCount = clampCount(this.operatorCount, Number(key));
 							return;
 						}
 						if (key === "g") {
@@ -251,7 +292,7 @@ export class ViController {
 					this.pendingCommand = null;
 					this.applyOperator(op, "0", this.operatorPrefixCount || 1);
 				} else {
-					this.operatorCount = this.operatorCount * 10 + Number(key);
+					this.operatorCount = clampCount(this.operatorCount, Number(key));
 				}
 				return;
 			}
@@ -278,11 +319,11 @@ export class ViController {
 		}
 
 		if (/^[1-9]$/.test(key)) {
-			this.operatorPrefixCount = this.operatorPrefixCount * 10 + Number(key);
+			this.operatorPrefixCount = clampCount(this.operatorPrefixCount, Number(key));
 			return;
 		}
 		if (key === "0" && this.operatorPrefixCount > 0) {
-			this.operatorPrefixCount *= 10;
+			this.operatorPrefixCount = Math.min(this.operatorPrefixCount * 10, VI_MAX_COUNT);
 			return;
 		}
 		const count = this.operatorPrefixCount || 1;
@@ -291,26 +332,53 @@ export class ViController {
 		switch (key) {
 			// Movement (repeatable by count)
 			case "h":
-				for (let i = 0; i < count; i++) host.moveCursor(0, -1);
+				// Batched: one host call for the whole count; stops by itself at
+				// col 0 (early-exit contract handled inside the host op).
+				host.moveCursorGraphemes(count, -1);
 				return;
 			case "l":
 			case " ":
-				for (let i = 0; i < count; i++) host.moveCursor(0, 1);
+				host.moveCursorGraphemes(count, 1);
 				return;
 			case "j":
-				for (let i = 0; i < count; i++) this.moveDown();
+				for (let i = 0; i < count; i++) {
+					const line = host.getCursorLine();
+					const col = host.getCursorCol();
+					this.moveDown();
+					if (host.getCursorLine() === line && host.getCursorCol() === col) break;
+				}
 				return;
 			case "k":
-				for (let i = 0; i < count; i++) this.moveUp();
+				for (let i = 0; i < count; i++) {
+					const line = host.getCursorLine();
+					const col = host.getCursorCol();
+					this.moveUp();
+					if (host.getCursorLine() === line && host.getCursorCol() === col) break;
+				}
 				return;
 			case "w":
-				for (let i = 0; i < count; i++) this.moveWordForward();
+				for (let i = 0; i < count; i++) {
+					const line = host.getCursorLine();
+					const col = host.getCursorCol();
+					this.moveWordForward();
+					if (host.getCursorLine() === line && host.getCursorCol() === col) break;
+				}
 				return;
 			case "b":
-				for (let i = 0; i < count; i++) this.moveWordBackward();
+				for (let i = 0; i < count; i++) {
+					const line = host.getCursorLine();
+					const col = host.getCursorCol();
+					this.moveWordBackward();
+					if (host.getCursorLine() === line && host.getCursorCol() === col) break;
+				}
 				return;
 			case "e":
-				for (let i = 0; i < count; i++) this.moveWordEnd();
+				for (let i = 0; i < count; i++) {
+					const line = host.getCursorLine();
+					const col = host.getCursorCol();
+					this.moveWordEnd();
+					if (host.getCursorLine() === line && host.getCursorCol() === col) break;
+				}
 				return;
 			case "0":
 				host.setCursorCol(0);
@@ -323,17 +391,24 @@ export class ViController {
 				return;
 			// Editing
 			case "x":
-				for (let i = 0; i < count; i++) this.deleteChar();
+				// Batched delete of up to `count` graphemes; no-op at/past EOL
+				// (early-exit contract handled inside the host op).
+				host.deleteGraphemesForward(count);
 				return;
 			case "X":
+				host.deleteGraphemesBackward(count);
+				return;
+			case "u": {
+				// Repeating undo is sensible: N undos. Stop once an undo no longer
+				// changes the buffer (undo stack exhausted).
+				const before = host.getText();
 				for (let i = 0; i < count; i++) {
-					if (host.getCursorCol() > 0) host.handleBackspace();
+					host.undo();
+					const after = host.getText();
+					if (after === before) break;
 				}
 				return;
-			case "u":
-				// Repeating undo is sensible: N undos.
-				for (let i = 0; i < count; i++) host.undo();
-				return;
+			}
 			case "r":
 				// r{char}: replace char(s); waits for the next key.
 				this.pendingCommand = { kind: "prefix", key: "r" };
@@ -989,15 +1064,6 @@ export class ViController {
 		if (target === null) return;
 		this.host.setCursorLine(target.line);
 		this.host.setCursorCol(target.col);
-	}
-
-	/** vi x: delete the character under the cursor (no-op at end of line). */
-	private deleteChar(): void {
-		const host = this.host;
-		const currentLine = host.getLines()[host.getCursorLine()] || "";
-		if (host.getCursorCol() < currentLine.length) {
-			host.handleForwardDelete();
-		}
 	}
 
 	/** vi D / d$: delete to end of line (no-op at end of line). */
