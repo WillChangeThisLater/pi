@@ -1281,3 +1281,109 @@ describe("Editor vi mode: count/hang hardening", () => {
 		assertState(editor, { cursor: { line: 2, col: 0 } });
 	});
 });
+
+describe("Editor vi mode: multi-char input routing", () => {
+	it("handleInput('dw') as ONE call in normal mode deletes a word, does not insert", () => {
+		const editor = createViEditor("hello world");
+		feedKeys(editor, "\x1b0");
+		editor.handleInput("dw");
+		assertState(editor, { text: "world", mode: "normal", cursor: { line: 0, col: 0 } });
+	});
+
+	it("handleInput('3w') as one call processes the count and motion", () => {
+		const editor = createViEditor("one two three four");
+		feedKeys(editor, "\x1b0");
+		editor.handleInput("3w");
+		assertState(editor, { text: "one two three four", mode: "normal", cursor: { line: 0, col: 14 } });
+	});
+
+	it("pasted multi-char data in normal mode runs as commands, never inserts", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1b0");
+		editor.handleInput("xx");
+		assertState(editor, { text: "llo", mode: "normal" });
+	});
+
+	it("arrow-key escape sequence in normal mode is forwarded to regular input", () => {
+		const editor = createViEditor("foo bar");
+		feedKeys(editor, "\x1b0");
+		editor.handleInput("\x1b[C");
+		assertState(editor, { text: "foo bar", mode: "normal", cursor: { line: 0, col: 1 } });
+	});
+
+	it("bracketed paste marker in normal mode is forwarded, not split", () => {
+		const editor = createViEditor("foo");
+		feedKeys(editor, "\x1b");
+		editor.handleInput("\x1b[200~abc\x1b[201~");
+		assertState(editor, { text: "fooabc" });
+	});
+
+	it("handleInput('\\x1bx') in insert mode enters normal mode and deletes a char", () => {
+		const editor = createViEditor("hello");
+		feedKeys(editor, "\x1b0i"); // insert mode, cursor col 0
+		// coalesced escape+x: enter normal mode, then x deletes the char at col 0
+		editor.handleInput("\x1bx");
+		assertState(editor, { text: "ello", mode: "normal", cursor: { line: 0, col: 0 } });
+	});
+
+	it("handleInput('\\x1bdw') in insert mode enters normal mode and deletes a word", () => {
+		const editor = createViEditor("hello world");
+		editor.setText("hello world");
+		feedKeys(editor, "\x1b0");
+		feedKeys(editor, "i"); // insert mode, cursor col 0
+		editor.handleInput("\x1bdw");
+		assertState(editor, { text: "world", mode: "normal" });
+	});
+
+	it("arrow keys in insert mode still move the cursor (not swallowed)", () => {
+		const editor = createViEditor("hello");
+		editor.handleInput("\x1b[D");
+		assertState(editor, { text: "hello", mode: "insert", cursor: { line: 0, col: 4 } });
+	});
+});
+
+describe("Editor vi mode: punctuation word classes (vim-exact)", () => {
+	it("dw on '(' of 'foo(bar); tail' deletes exactly one char", () => {
+		const editor = createViEditor("foo(bar); tail");
+		feedKeys(editor, "\x1b0w"); // cursor on '(' (col 3)
+		assertState(editor, { cursor: { line: 0, col: 3 } });
+		feedKeys(editor, "dw");
+		assertState(editor, { text: "foobar); tail", cursor: { line: 0, col: 3 } });
+	});
+
+	it("w moves over a run of the same punctuation char as one word", () => {
+		const editor = createViEditor("a)) b");
+		feedKeys(editor, "\x1b0ww");
+		assertState(editor, { cursor: { line: 0, col: 4 } });
+	});
+
+	it("w stops at each different punctuation char", () => {
+		const editor = createViEditor("a()!");
+		feedKeys(editor, "\x1b0ww");
+		assertState(editor, { cursor: { line: 0, col: 2 } });
+		feedKeys(editor, "w");
+		assertState(editor, { cursor: { line: 0, col: 3 } });
+	});
+
+	it("b moves back over a punctuation run as one word", () => {
+		const editor = createViEditor("a)) b");
+		feedKeys(editor, "\x1b$b");
+		assertState(editor, { cursor: { line: 0, col: 4 } });
+		feedKeys(editor, "b");
+		assertState(editor, { cursor: { line: 0, col: 1 } });
+	});
+
+	it("e on a punctuation run lands on its last char", () => {
+		const editor = createViEditor("a)) b");
+		feedKeys(editor, "\x1b0e");
+		assertState(editor, { cursor: { line: 0, col: 2 } });
+		feedKeys(editor, "e");
+		assertState(editor, { cursor: { line: 0, col: 4 } });
+	});
+
+	it("w from a word stops at the first punctuation char, not past the run", () => {
+		const editor = createViEditor("foo... bar");
+		feedKeys(editor, "\x1b0w");
+		assertState(editor, { cursor: { line: 0, col: 3 } });
+	});
+});

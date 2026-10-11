@@ -28,6 +28,17 @@ function clampCount(count: number, digit: number): number {
 	return Math.min(count * 10 + digit, VI_MAX_COUNT);
 }
 
+/**
+ * vim word class of a char (iskeyword model): whitespace, word chars
+ * (letters/digits/underscore), or one punctuation char — where a maximal RUN
+ * of the SAME punctuation char counts as one word, but different punctuation
+ * chars are each their own word (`))` is one word; `()!` is three).
+ */
+function charClass(ch: string | undefined): string {
+	if (ch === undefined || isWhitespaceChar(ch)) return "space";
+	return /\w/.test(ch) ? "word" : `punct:${ch}`;
+}
+
 /** The subset of Editor internals a vi command may use. */
 export interface ViHost {
 	/** Live line array of the editor buffer (mutations are visible to the editor). */
@@ -149,6 +160,20 @@ export class ViController {
 			this.enterNormalMode();
 			return true;
 		}
+		// Coalesced keystrokes in insert mode: terminal input over SSH may
+		// deliver escape+key as one chunk (e.g. "\x1bd" = escape then d). Treat
+		// it as escape (enter normal mode) followed by normal-mode keys, so the
+		// keystrokes are not silently dropped. Recognized terminal escape
+		// sequences (arrows, SS3 codes, paste markers, ...) are NOT typeable
+		// command sequences — forward them to regular input untouched.
+		if (this.mode === "insert" && data.length > 1 && data.charCodeAt(0) === 27) {
+			if (data[1] === "[" || data[1] === "O" || data[1] === "\x1b") {
+				return false;
+			}
+			this.enterNormalMode();
+			for (const ch of data.slice(1)) this.handleNormalInput(ch);
+			return true;
+		}
 		// In normal mode only unmodified printable keys are vi commands;
 		// everything else (arrows, ctrl/alt combos, home/end, ...) keeps
 		// its regular keybinding behavior.
@@ -166,6 +191,21 @@ export class ViController {
 	 * enter, etc. keep working exactly as before).
 	 */
 	private handleNormalInput(data: string): void {
+		// Multi-character data (terminal keystroke coalescing over SSH,
+		// non-bracketed paste). Escape-prefixed chunks are recognized terminal
+		// sequences (arrows, bracketed paste markers, ...) — NOT typeable
+		// command sequences — so they are forwarded to regular input as one
+		// unit. Printable multi-char data ("dw", "3w", pasted "abc") is a key
+		// SEQUENCE: process it char by char through the vi state machine
+		// (vim does exactly this). Normal mode must never insert text verbatim.
+		if (data.length > 1 && data.charCodeAt(0) === 27) {
+			this.host.handleRegularInput(data);
+			return;
+		}
+		if (data.length > 1) {
+			for (const ch of data) this.handleNormalInput(ch);
+			return;
+		}
 		const printable = decodePrintableKey(data) ?? (data.length === 1 && data.charCodeAt(0) >= 32 ? data : undefined);
 		if (printable !== undefined) {
 			this.dispatchCommand(printable);
@@ -760,32 +800,28 @@ export class ViController {
 	private currentRunEnd(col: number, line: string): number | null {
 		const len = line.length;
 		if (col >= len) return null;
-		const classOf = (ch: string | undefined): "word" | "space" | "punct" =>
-			ch === undefined || isWhitespaceChar(ch) ? "space" : /\w/.test(ch) ? "word" : "punct";
-		const cls = classOf(line[col]);
+		const cls = charClass(line[col]);
 		let i = col + 1;
-		while (i < len && classOf(line[i]) === cls) i++;
+		while (i < len && charClass(line[i]) === cls) i++;
 		return i - 1;
 	}
 
 	private wordEnd(col: number, line: string): number | null {
 		const len = line.length;
 		if (col >= len) return null;
-		const classOf = (ch: string | undefined): "word" | "space" | "punct" =>
-			ch === undefined || isWhitespaceChar(ch) ? "space" : /\w/.test(ch) ? "word" : "punct";
-		const current = classOf(line[col]);
+		const current = charClass(line[col]);
 		let i = col + 1;
 		// Mid-run: scan to the last char of the current run.
-		if (current !== "space" && i < len && classOf(line[i]) === current) {
-			while (i < len && classOf(line[i]) === current) i++;
+		if (current !== "space" && i < len && charClass(line[i]) === current) {
+			while (i < len && charClass(line[i]) === current) i++;
 			return i - 1;
 		}
 		// At the end of a run (or on whitespace): skip whitespace, take the
 		// next run's last char.
-		while (i < len && classOf(line[i]) === "space") i++;
+		while (i < len && charClass(line[i]) === "space") i++;
 		if (i >= len) return null;
-		const next = classOf(line[i]);
-		while (i < len && classOf(line[i]) === next) i++;
+		const next = charClass(line[i]);
+		while (i < len && charClass(line[i]) === next) i++;
 		return i - 1;
 	}
 
@@ -1008,22 +1044,19 @@ export class ViController {
 	}
 
 	/**
-	 * vim w: position of the first char of the next word (word = run of word
-	 * chars, punctuation counts as a word of its own).
+	 * vim w: position of the first char of the next word. Words are runs of
+	 * the same char class (word chars / whitespace / one punctuation char,
+	 * where a run of the same punct char is a single word).
 	 */
 	private wordForward(col: number, line: string): number {
 		let i = col;
 		const len = line.length;
 		while (i < len && isWhitespaceChar(line[i])) i++;
 		if (i > col) return i; // Started on whitespace: stop at the next word's start.
-		if (i < len) {
-			const isWord = /\w/.test(line[i]);
-			if (isWord) {
-				while (i < len && /\w/.test(line[i])) i++;
-			} else {
-				while (i < len && !isWhitespaceChar(line[i])) i++;
-			}
-		}
+		if (i >= len) return i;
+		const cls = charClass(line[i]);
+		i++;
+		while (i < len && charClass(line[i]) === cls) i++;
 		while (i < len && isWhitespaceChar(line[i])) i++;
 		return i;
 	}
@@ -1035,12 +1068,8 @@ export class ViController {
 		let i = col;
 		while (i > 0 && isWhitespaceChar(line[i - 1])) i--;
 		if (i > 0) {
-			const isWord = /\w/.test(line[i - 1]);
-			if (isWord) {
-				while (i > 0 && /\w/.test(line[i - 1])) i--;
-			} else {
-				while (i > 0 && !isWhitespaceChar(line[i - 1])) i--;
-			}
+			const cls = charClass(line[i - 1]);
+			while (i > 0 && charClass(line[i - 1]) === cls) i--;
 		}
 		return i;
 	}
