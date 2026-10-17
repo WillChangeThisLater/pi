@@ -149,11 +149,111 @@ npm dependencies work too. Add a `package.json` next to your extension (or in a 
 
 For distributed pi packages installed with `pi install` (npm or git), runtime deps must be in `dependencies`. Package installation uses production installs (`npm install --omit=dev`) by default, so `devDependencies` are not available at runtime; when `npmCommand` is configured, git packages use plain `install` for compatibility with wrappers.
 
+A run proceeds from input and `before_agent_start`, through model, message, and tool events, to `agent_end`.
+Pi counts as busy while a run starts, including the compaction check and `before_agent_start`, so messages sent meanwhile go into the starting run.
+Automatic retries, recovery, compaction, or queued work can continue afterward.
+<a id="agent_start--agent_end--agent_before_settle--agent_settled"></a>
+
 Node.js built-ins (`node:fs`, `node:path`, etc.) are also available.
 
 ## Writing an Extension
 
-An extension exports a default factory function that receives `ExtensionAPI`. The factory can be synchronous or asynchronous:
+## Choose an integration point
+
+| Capability | Main API |
+|---|---|
+| Observe or modify lifecycle behavior | `pi.on()` |
+| Add a model-callable operation | `pi.registerTool()` |
+| Add a `/` command | `pi.registerCommand()` |
+| Add a shortcut or CLI flag | `pi.registerShortcut()` or `pi.registerFlag()` |
+| Send user or custom messages | `pi.sendUserMessage()` or `pi.sendMessage()` |
+| Persist non-context session data | `pi.appendEntry()` |
+| Change active tools, model, or thinking level | Session control methods on `pi` |
+| Add a model provider | `pi.registerProvider()` |
+| Add an MCP server | `pi.registerMcpServer()` |
+| Route each request to a model | [`pi.registerVirtualModel()`](virtual-models.md) |
+| Add terminal rendering | Renderer registration and `ctx.ui` |
+| Communicate with another extension | `pi.events` |
+
+Use the exported declarations in [`extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) for exact event, context, tool, and result types.
+
+## Follow the extension contracts
+
+<a id="events"></a>
+<a id="work-with-events"></a>
+
+### Events and concurrency
+
+Handlers run in extension load and registration order. `pi.on()` returns a function that unsubscribes that registration; changes do not affect a dispatch already in progress.
+Some events notify; others transform data, replace results, or cancel an operation.
+Use each event’s declared result type rather than assuming every return value has an effect.
+
+Events cover resource discovery, sessions, agent and message lifecycle, providers, tools, and raw input.
+
+`before_agent_start` exposes both the current prompt and its structured `systemPromptOptions`. `event.messageType` says what started the run: `"user"` for a prompt or `pi.sendUserMessage()`, with `prompt` and `images`; `"custom"` for `pi.sendMessage(..., { triggerTurn: true })`, with the starting `message` and no `prompt`. A returned `message` is added to either kind of run; check `messageType` to skip runs started by custom messages. Prefer changing prompt sections, selected tools, or guidelines so Pi can append a transcript delta. Returning `systemPrompt`, or setting `forceSystemPrompt`, replaces the whole prompt for that run while the transcript continues recording the structured sections. Providers receive the forced text as their leading system prompt.
+
+`message_end` can replace a finalized message while preserving its role. `tool_call` can mutate input or block execution. `tool_result` handlers compose, with each handler seeing prior changes.
+
+<a id="provider_stream_event"></a>
+
+`provider_stream_event` fires for each parsed provider stream event before Pi normalizes it. The event identifies the provider, API, and model; `event.data` is the earliest structured value available to Pi, not necessarily the original HTTP bytes or SSE frame. Treat it as read-only because mutation can affect normalization. The event is notification-only and is not persisted.
+
+Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported without changing the provider response. See [`debug-provider.ts`](../examples/extensions/debug-provider.ts) for an opt-in viewer that groups raw events by assistant message.
+
+<a id="context_with_system"></a>
+
+`context` transforms conversation messages without prompt and tool system messages; Pi restores that state afterward. Use `context_with_system` only when a request-local transformation must own the complete transcript, and keep a system message at index zero.
+
+`turn_end` and `agent_before_settle` are actionable boundaries. Their handlers can chain proposed `custom`, `custom_message`, `context_edit`, or `compaction` entries and return `continue: true` for one next model request. Guard continuation conditions because an unconditional continuation can loop. Use the exported event declarations for the complete validation and ordering contract.
+
+<a id="cache_warming_decision"></a>
+
+`cache_warming_decision` can override an idle prompt-cache refresh with `{ action: "warm" }` or `{ action: "stop" }`. The last handler that returns an action wins.
+
+Tool calls from one assistant message can run in parallel.
+Do not assume a sibling call or result exists when another tool event runs.
+Use `ctx.signal` for nested work owned by an active turn; commands and idle session events often have no operation signal.
+
+A `user_bash` handler that returns `undefined` passes the command to the next handler and then to local execution if no handler handles it. Returning `operations` or `result` stops propagation. A handler failure blocks the command rather than falling through to local execution.
+
+<a id="custom-tools"></a>
+<a id="register-tools"></a>
+
+### Tools
+
+A custom tool defines a name, model-facing description, TypeBox parameter schema, and `execute()` function.
+Its result requires model-facing `content` and a `details` field for rendering or state reconstruction.
+Use `details: undefined` when there are no structured details. If the tool makes nested model calls, include their `usage` in the result so session totals remain accurate.
+
+Throw from `execute()` to produce a failed tool result.
+Returning an object does not mark it as an error.
+Return `terminate: true` only when the agent should skip its automatic follow-up after every completed tool in that batch agrees to terminate.
+
+Use sequential execution when tools share mutable in-memory state.
+File-mutating tools should wrap the complete read-modify-write operation with `withFileMutationQueue()`.
+Truncate large model-facing results and tell the model where to read the complete output.
+
+Declare `outputSchema` and return a matching `structuredContent` when the result is data. The model still receives `content`; programmatic callers such as codemode scripts receive `structuredContent` instead of the text. Tools without `outputSchema` are passed to scripts as their text content. To report a failure that still carries data, return the result with `isError: true` instead of throwing: the model sees an error, and scripts still receive `structuredContent`.
+
+A tool can run other tools with `ctx.executeTool(name, args, { signal, onUpdate })`. Nested calls go through argument validation and the `tool_call` and `tool_result` handlers like model-issued calls, and emit `tool_execution_start`, `tool_execution_update`, and `tool_execution_end`; all of these events carry `parentToolCallId`, and their `toolCallId` is assigned by pi as `<parent id>/<n>`. These ids do not appear as tool calls or tool results in the transcript. Nested calls do not add transcript entries: their results only reach the calling tool, which reports them itself, for example through `onUpdate` and `details`. The session keeps a bounded record of them (name, arguments, status, duration, error; never results) as `nestedCalls` on the calling tool's result message. It is used for compaction file lists and shown in HTML exports. Arguments over 8 KiB per call or 32 KiB per tool result are omitted, at most 256 calls are kept, and `complete: false` marks a record that lost anything. The `usage` of nested results, at every depth, is added to the calling tool's result `usage`, so a tool reports only its own usage, not that of the tools it called. `ctx.tools` lists the tools `ctx.executeTool()` can call. `tool_result` handlers that redact `content` should also replace `structuredContent`; replacing only `content` drops it.
+
+See [`hello.ts`](../examples/extensions/hello.ts), [`todo.ts`](../examples/extensions/todo.ts), [`dynamic-tools.ts`](../examples/extensions/dynamic-tools.ts), and [`truncated-tool.ts`](../examples/extensions/truncated-tool.ts).
+
+### Tool exposure
+
+`exposure` controls how the model reaches a tool. "Callable" means callable from other tools through `ctx.executeTool()` (`ctx.tools`), as the `codemode` tool's scripts do:
+
+- `direct` (default): declared to the model while active, and callable while active.
+- `model-only`: declared to the model while active, never callable. Use it for tools that orchestrate other tools or ask the user.
+- `codemode`: callable whenever registered, and listed by the `codemode` tool. Not declared to the model unless activated explicitly.
+- `deferred`: like `codemode`, but codemode tools do not list it; `tool_search` can find and activate it.
+- `hidden`: registered but unreachable. Re-register a tool with `exposure: "hidden"` to withdraw it, since tools cannot be unregistered.
+
+`namespace: { name, aliases, description, instructions }` groups related tools, as MCP servers do. Codemode tools list a namespace under one heading with its `description`. `instructions` holds longer usage guidance; it is not listed, and codemode scripts read it with `describeNamespace(name)`. `aliases` are other names scripts may look the namespace up by, for example the server name `docs` for `mcp__docs`; a name and the same name as a script identifier (`my-docs`, `my_docs`) match alike.
+
+Registering a `direct` or `model-only` tool activates it; the other exposures are not activated on registration. The active set (`pi.getActiveTools()`, `pi.setActiveTools()`) is the set of tools declared to the model. `pi.getAllTools()` reports each tool's `exposure`, `namespace`, `annotations`, and `reachesTools`.
+
+`annotations` are hints about what a tool does, with the meaning of MCP tool annotations: `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`. MCP tools carry the hints their server declares. Missing hints take the MCP defaults: a tool is not read-only, and may be destructive and reach an open world. The hints are not verified, but a permission extension can use them to decide which calls to confirm. This confirms the calls Codex asks approval for:
 
 ```typescript
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -431,6 +531,10 @@ pi.on("session_before_switch", async (event, ctx) => {
 
 After a successful switch or new-session action, pi emits `session_shutdown` for the old extension instance, reloads and rebinds extensions for the new session, then emits `session_start` with `reason: "new" | "resume"` and `previousSessionFile`.
 Do cleanup work in `session_shutdown`, then reestablish any in-memory state in `session_start`.
+
+A tool that orchestrates other tools can adjust what the model sees while it is active with `prepareLoadout(loadout)`. It runs whenever the active tools change and receives the declared tools, the callable tools, and every registered tool with its exposure, namespace, and prompt guidelines. It returns replacement `descriptions` for declared tools (including its own) and `hiddenDeclarations`: active tools whose declarations requests leave out while they stay active and callable. The default system prompt leaves hidden tools out of its tool list and rules, and names no tool in the skills hint when the file reader is hidden, so the orchestrating tool should present their guidelines itself. `codemode` uses only this hook, `exposure`, `reachesTools`, and `ctx.executeTool()`, so another tool can implement the same behavior under a different name.
+
+A tool that reaches other tools declares which ones a call may reach with `reachesTools(input)`: `"all"`, or the words of the input that may name them, where a word refers to every tool or namespace whose name it contains. `codemode` returns `"all"` for scripts that search or list tools and the words of the script otherwise; `tool_search` always returns `"all"`. Extensions that register tools late use it from their `tool_call` handler to finish registering the tools a call needs before it runs, as the MCP extension does for servers that are still connecting. The MCP extension also activates `codemode` or `tool_search` for MCP tools only when the tool of that name declares `reachesTools`.
 
 #### session_before_fork
 

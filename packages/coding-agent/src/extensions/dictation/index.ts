@@ -625,6 +625,8 @@ export default function (pi: ExtensionAPI) {
 	// Explain the <dictated> tag once the user has actually dictated (or the prompt itself is
 	// tagged), so the notice does not burden sessions that never use dictation.
 	pi.on("before_agent_start", (event) => {
+		// Only user-prompt runs carry `prompt`; custom-message runs have nothing to tag.
+		if (event.messageType !== "user") return;
 		if (dictatedThisSession || event.prompt.includes("<dictated>")) {
 			event.systemPromptOptions.sections.dictation = DICTATION_NOTICE;
 		}
