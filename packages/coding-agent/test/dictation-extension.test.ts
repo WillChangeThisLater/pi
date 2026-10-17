@@ -120,13 +120,21 @@ describe("dictation tagging", () => {
 		dictationExtension(pi);
 		const { ctx } = createFakeCtx();
 
-		const before = { prompt: "hi", systemPromptOptions: { sections: {} as Record<string, string> } };
+		const before = {
+			messageType: "user",
+			prompt: "hi",
+			systemPromptOptions: { sections: {} as Record<string, string> },
+		};
 		await emit(handlers, "before_agent_start", before);
 		expect(before.systemPromptOptions.sections.dictation).toBeUndefined();
 
 		await handlers.commands.get("dictate")?.("", ctx);
 
-		const after = { prompt: "hi", systemPromptOptions: { sections: {} as Record<string, string> } };
+		const after = {
+			messageType: "user",
+			prompt: "hi",
+			systemPromptOptions: { sections: {} as Record<string, string> },
+		};
 		await emit(handlers, "before_agent_start", after);
 		expect(after.systemPromptOptions.sections.dictation).toBe(DICTATION_NOTICE);
 	});
@@ -136,6 +144,7 @@ describe("dictation tagging", () => {
 		dictationExtension(pi);
 
 		const event = {
+			messageType: "user",
 			prompt: "please <dictated>\nhello\n</dictated>",
 			systemPromptOptions: { sections: {} as Record<string, string> },
 		};

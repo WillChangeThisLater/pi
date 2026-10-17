@@ -35,7 +35,7 @@ Each `models` entry adds a model to the provider. An entry whose `id` matches an
 | `baseUrl` | string |  | Overrides the provider baseUrl. |
 | `reasoning` | boolean | `false` | Whether the model supports thinking. |
 | `thinkingLevelMap` | object |  | Provider value sent for each thinking level. null marks a level unsupported. Levels the model does not map use the provider's default value through high; xhigh and max are unsupported. |
-| `input` | `("text" \| "image")[]` | `["text"]` |  |
+| `input` | `("text" \| "image" \| "video" \| "audio")[]` | `["text"]` |  |
 | `inputLimits` | [object](#input-limits) |  |  |
 | `cost` | object |  |  |
 | `cost.input` | number |  | Required. Input cost in USD per million tokens. |
@@ -65,7 +65,7 @@ Each `modelOverrides` key is the ID of a built-in or extension model. Unknown ID
 | `name` | string |  | Display name, also matched by --model patterns. |
 | `reasoning` | boolean |  | Whether the model supports thinking. |
 | `thinkingLevelMap` | object |  | Provider value sent for each thinking level. null marks a level unsupported. Levels the model does not map use the provider's default value through high; xhigh and max are unsupported. |
-| `input` | `("text" \| "image")[]` |  |  |
+| `input` | `("text" \| "image" \| "video" \| "audio")[]` |  |  |
 | `inputLimits` | [object](#input-limits) |  |  |
 | `cost` | object |  |  |
 | `cost.input` | number |  | Input cost in USD per million tokens. |

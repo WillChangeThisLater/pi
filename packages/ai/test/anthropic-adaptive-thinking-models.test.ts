@@ -38,6 +38,9 @@ describe("Anthropic adaptive thinking model metadata", () => {
 					// Regression for #9323: Fireworks uses catalog effort metadata and
 					// verified fallbacks, not a fixed set of adaptive model names.
 					modelId.startsWith("fireworks/") ||
+					// Fork: Kimi Coding's Anthropic-compatible API uses adaptive thinking
+					// (forceAdaptiveThinking) for every kimi-coding model.
+					modelId.startsWith("kimi-coding/") ||
 					/(opus[-.](4[-.][678]|5)|sonnet[-.]4[-.]6|sonnet[-.]5|haiku[-.]5[-.]5|fable[-.]5)/.test(modelId),
 			),
 		);

@@ -548,6 +548,11 @@
       "description": "Horizontal padding for the input editor.",
       "default": 0
     },
+    "viMode": {
+      "type": "boolean",
+      "description": "Enable basic vi editing in the prompt editor (set -o vi style).",
+      "default": false
+    },
     "outputPad": {
       "anyOf": [
         {

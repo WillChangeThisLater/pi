@@ -1834,6 +1834,8 @@ function createKimiCodingModels(kimiModels: Record<string, ModelsDevModel>): Mod
 			},
 			contextWindow: m.limit?.context || 4096,
 			maxTokens: m.limit?.output || 4096,
+			// Kimi Code reports every model as always-thinking.
+			thinkingLevelMap: { off: null },
 		});
 		recordModelsDevReasoningOptions("kimi-coding", normalizedId, m);
 	}

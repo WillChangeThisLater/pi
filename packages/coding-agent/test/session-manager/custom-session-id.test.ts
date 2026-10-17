@@ -4,7 +4,9 @@ import { basename, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { SessionManager } from "../../src/core/session-manager.ts";
 
-const UUID_V7_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+// Fork: default session ids are human-readable ("word-word-1234"); upstream uses UUIDv7.
+const UUID_V7_RE =
+	/^(?:[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)$/;
 
 describe("SessionManager.newSession with custom id", () => {
 	it("uses the provided id instead of generating one", () => {

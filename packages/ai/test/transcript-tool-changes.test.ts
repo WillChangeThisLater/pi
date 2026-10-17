@@ -339,31 +339,22 @@ describe("transcript system messages", () => {
 		);
 	});
 
-	type KimiPayload = {
-		tools?: Array<{ function?: { name: string } }>;
-		messages: Array<{ role: string; tools?: Array<{ function?: { name: string } }> }>;
-	};
+	// Fork: kimi-coding exposes an Anthropic-compatible API, so transcript tool changes follow the
+	// native anthropic-messages contract: initial tools go in the top-level list and additions are
+	// anchored in system messages as tool_addition blocks (like the Anthropic native test above).
+	test.each(["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"] as const)(
+		"anchors Kimi Coding %s additions in native system messages",
+		async (modelId) => {
+			const payload = await capturePayload<AnthropicPayload>(getModel("kimi-coding", modelId), additionContext);
 
-	// #10720: Kimi Coding uses Chat Completions so K3-style models keep added tools out of the top-level list.
-	test.each(["k3", "k3-256k", "kimi-for-coding"] as const)("anchors additions for Kimi Coding %s", async (modelId) => {
-		const payload = await capturePayload<KimiPayload>(getModel("kimi-coding", modelId), additionContext);
-
-		expect(payload.tools?.map((value) => value.function?.name)).toEqual(["base_tool"]);
-		expect(payload.messages.find((message) => message.tools)?.tools?.map((value) => value.function?.name)).toEqual([
-			"late_tool",
-		]);
-	});
-
-	// #10720: Kimi Code Highspeed rejects tool-bearing system messages.
-	test("keeps Kimi Coding Highspeed additions in top-level tools", async () => {
-		const payload = await capturePayload<KimiPayload>(
-			getModel("kimi-coding", "kimi-for-coding-highspeed"),
-			additionContext,
-		);
-
-		expect(payload.tools?.map((value) => value.function?.name)).toEqual(["base_tool", "late_tool"]);
-		expect(payload.messages.some((message) => message.tools !== undefined)).toBe(false);
-	});
+			// Without mid-conversation tool-change compat the API folds the full tool state into
+			// the top-level list on every request.
+			expect(payload.tools?.map((value) => value.name)).toEqual(["base_tool", "late_tool"]);
+			expect(
+				payload.messages.some((message) => message.content.some((block) => block.type === "tool_addition")),
+			).toBe(false);
+		},
+	);
 
 	test("keeps Kimi K2 system text inline without dynamic tool messages", async () => {
 		const model: Model<"openai-completions"> = {

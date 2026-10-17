@@ -101,7 +101,9 @@
                     "items": {
                       "enum": [
                         "text",
-                        "image"
+                        "image",
+                        "video",
+                        "audio"
                       ]
                     },
                     "default": [
@@ -225,7 +227,9 @@
                       "items": {
                         "enum": [
                           "text",
-                          "image"
+                          "image",
+                          "video",
+                          "audio"
                         ]
                       }
                     },
