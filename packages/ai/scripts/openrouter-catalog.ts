@@ -1,4 +1,4 @@
-import type { ClassifierModel, ImageModel, Model, ModelCost } from "../src/types.ts";
+import type { ClassifierModel, ImageModel, Model, ModelCost, ModelCostTier } from "../src/types.ts";
 import { getOpenRouterThinkingLevelMap, type OpenRouterReasoningMetadata } from "./openrouter-reasoning-options.ts";
 
 export interface OpenRouterModelListItem {

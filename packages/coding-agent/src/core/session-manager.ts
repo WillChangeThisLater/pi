@@ -9,7 +9,6 @@ import {
 	type ToolResultMessage,
 	type Usage,
 	type UserMessage,
-	uuidv7,
 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {

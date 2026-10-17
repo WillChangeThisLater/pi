@@ -8,9 +8,11 @@
   makeWrapper,
   nodejs_22,
   ripgrep,
+  alsa-utils,
   source,
   stdenv,
   wl-clipboard,
+  whisper-cpp,
   xclip,
 }:
 
@@ -27,6 +29,11 @@ let
     # The typed catalog is the representation whose bytes the revision hashes.
     url = "https://pi.dev/api/models/revisions/${modelCatalogPin.revision}?types=chat,image,classifier";
     sha256 = lib.removePrefix "sha256-" modelCatalogPin.revision;
+  };
+  whisperModel = fetchurl {
+    name = "ggml-base.en.bin";
+    url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin";
+    hash = "sha256-oDd5yG3zMjB19eeWyyzlAp8A7Ihp7uP9+4l6/jbG0AI=";
   };
 
   workspacePackages = stdenv.mkDerivation {
@@ -122,6 +129,7 @@ stdenv.mkDerivation {
 
     makeWrapper ${nodejs}/bin/node "$out/bin/pi" \
       --add-flags "$out/lib/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js" \
+      --set PI_DICTATION_BACKEND "whisper-cli -m ${whisperModel} -nt {file}" \
       --prefix PATH : ${
         lib.makeBinPath (
           [
@@ -132,6 +140,9 @@ stdenv.mkDerivation {
           ++ lib.optionals stdenv.hostPlatform.isLinux [
             wl-clipboard
             xclip
+            # we need this for speech to text
+            whisper-cpp
+            alsa-utils
           ]
         )
       }
